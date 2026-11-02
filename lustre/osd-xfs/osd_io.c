@@ -23,6 +23,8 @@
 
 #include <lustre_compat.h>
 
+#include <lustre_quota.h>
+
 #include "osd_internal.h"
 
 /* ------------------------------------------------------------------ */
@@ -1094,8 +1096,10 @@ static int osd_declare_write_commit(const struct lu_env *env,
 {
 	struct osd_object *obj = osd_dt_obj(dt);
 	struct inode *inode = obj->oo_inode;
+	struct osd_thandle *oh = osd_thandle(handle);
+	enum osd_quota_local_flags local_flags = 0;
 	long long space = 0;
-	int i;
+	int i, rc;
 
 	ENTRY;
 
@@ -1103,8 +1107,9 @@ static int osd_declare_write_commit(const struct lu_env *env,
 		RETURN(-ENOENT);
 
 	/*
-	 * Declare the buffers that are not already allocated on disk. A
-	 * rewrite of existing blocks consumes no new space.
+	 * Charge the buffers that are not already allocated on disk. A
+	 * rewrite of existing blocks consumes no new space, and charging it
+	 * would make a user's usage climb without their file growing.
 	 *
 	 * For a write, lnb_hole is the caller's statement that this range was
 	 * not there before.
@@ -1112,21 +1117,61 @@ static int osd_declare_write_commit(const struct lu_env *env,
 	for (i = 0; i < npages; i++) {
 		if (lnb[i].lnb_rc == -ENOSPC || lnb[i].lnb_len == 0)
 			continue;
-		if (lnb[i].lnb_file_offset >= i_size_read(inode) ||
-		    lnb[i].lnb_hole)
+		if (!(lnb[i].lnb_flags & OBD_BRW_OVER_USRQUOTA) &&
+		    lnb[i].lnb_file_offset >= i_size_read(inode))
+			space += lnb[i].lnb_len;
+		else if (lnb[i].lnb_hole)
 			space += lnb[i].lnb_len;
 	}
 
 	/*
-	 * Declare the space, so the reservation can ask whether the
-	 * filesystem has it at all: a transaction that has started must not
-	 * be able to fail on it.
+	 * Declare the space itself, not just the quota. These are different
+	 * questions: quota asks whether this user may consume it, the
+	 * reservation asks whether the filesystem has it at all, and a
+	 * transaction that has started must not be able to fail on either.
 	 */
 	osd_declare_op(handle, OSD_OT_WRITE,
 		       (space + (1 << inode->i_blkbits) - 1) >>
 		       inode->i_blkbits, 0);
 
-	RETURN(0);
+	if (space == 0)
+		RETURN(0);
+
+	/*
+	 * Quota is accounted in 1 KiB units, which is what lquota expects for
+	 * a block resource.
+	 */
+	space = stoqb(space);
+
+	/* stale flags from a previous use of these buffers */
+	lnb[0].lnb_flags &= ~OBD_BRW_OVER_ALLQUOTA;
+
+	rc = osd_declare_inode_qid(env, i_uid_read(inode), i_gid_read(inode),
+				   osd_get_projid(inode), space, oh, obj,
+				   &local_flags, true);
+
+	/*
+	 * The flags go on lnb[0] only, which is where the reply carries them
+	 * back to the client, and the same place osd-ldiskfs puts them.
+	 */
+	if (local_flags & QUOTA_FL_OVER_USRQUOTA)
+		lnb[0].lnb_flags |= OBD_BRW_OVER_USRQUOTA;
+	if (local_flags & QUOTA_FL_OVER_GRPQUOTA)
+		lnb[0].lnb_flags |= OBD_BRW_OVER_GRPQUOTA;
+	if (local_flags & QUOTA_FL_OVER_PRJQUOTA)
+		lnb[0].lnb_flags |= OBD_BRW_OVER_PRJQUOTA;
+	if (local_flags & QUOTA_FL_ROOT_PRJQUOTA)
+		lnb[0].lnb_flags |= OBD_BRW_ROOT_PRJQUOTA;
+
+	/*
+	 * -EDQUOT must be returned, not swallowed. An earlier version turned
+	 * it into 0 on the theory that the flags alone would tell the client,
+	 * which left the slave correctly refusing the reservation while the
+	 * write went ahead anyway: 128 MiB stored against a 32 MiB limit, with
+	 * the accounting reporting it accurately the whole time. The refusal
+	 * has to reach ofd_commitrw_write() for the RPC to fail.
+	 */
+	RETURN(rc);
 }
 
 static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,

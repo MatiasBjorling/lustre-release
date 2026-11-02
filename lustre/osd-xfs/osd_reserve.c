@@ -10,8 +10,8 @@
  * outstanding OSD claims. A failed sample refuses admission; it must not
  * silently disable the check.
  *
- * This does NOT reserve XFS allocation-group space, log tickets or metadata
- * btree growth. Even with no external writers, XFS can
+ * This does NOT reserve XFS allocation-group space, log tickets, metadata
+ * btree growth or quota resources. Even with no external writers, XFS can
  * fail an admitted operation because its native reservations and allocation
  * constraints differ from these scalar estimates. It is an early ENOSPC
  * check, not a guarantee of execution success.

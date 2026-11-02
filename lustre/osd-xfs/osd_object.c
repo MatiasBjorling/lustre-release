@@ -121,6 +121,30 @@ static int osd_lu_object_init(const struct lu_env *env, struct lu_object *l,
 		RETURN(0);
 	}
 
+	/*
+	 * The quota accounting objects are entirely virtual: there is nothing
+	 * on disk behind them, the answers come from sb->s_qcop. So they have
+	 * no inode, but they must still report as existing or the quota slave
+	 * concludes that "space accounting isn't functional" and refuses to
+	 * enable enforcement.
+	 *
+	 * osd-zfs does the same thing but has a real dnode to point at;
+	 * osd-ldiskfs has a real inode (the ext4 quota file). Here there is
+	 * neither, so every path that assumes oo_inode != NULL for an existing
+	 * object has to tolerate this one.
+	 */
+	if (unlikely(fid_is_acct(fid))) {
+		bool avail = osd_acct_available(dev, fid);
+
+		if (avail) {
+			obj->oo_dt.do_index_ops = &osd_acct_index_ops;
+			l->lo_header->loh_attr |= LOHA_EXISTS;
+		}
+		CDEBUG(D_QUOTA, "%s: accounting object "DFID" available=%d\n",
+		       osd_name(dev), PFID(fid), avail);
+		RETURN(0);
+	}
+
 	rc = osd_fid_lookup(env, dev, fid, &dentry);
 	CDEBUG(D_INODE, "osd-xfs: object_init "DFID" -> rc %d\n",
 	       PFID(fid), rc);
@@ -275,6 +299,7 @@ static void osd_inode_getattr(const struct lu_env *env, struct inode *inode,
 	}
 	attr->la_uid    = i_uid_read(inode);
 	attr->la_gid    = i_gid_read(inode);
+	attr->la_projid = osd_get_projid(inode);
 	attr->la_flags  = 0;
 	attr->la_nlink  = inode->i_nlink;
 	attr->la_rdev   = inode->i_rdev;
@@ -290,8 +315,22 @@ static int osd_attr_get(const struct lu_env *env, struct dt_object *dt,
 	if (unlikely(obj->oo_destroyed))
 		return -ENOENT;
 
-	if (obj->oo_inode == NULL)
+	if (obj->oo_inode == NULL) {
+		/*
+		 * The quota accounting objects have no inode -- they are a
+		 * view onto sb->s_qcop. Report a plausible read-only regular
+		 * file so a caller that stats before using the index does not
+		 * fail.
+		 */
+		if (unlikely(fid_is_acct(lu_object_fid(&dt->do_lu)))) {
+			memset(attr, 0, sizeof(*attr));
+			attr->la_valid = LA_TYPE | LA_MODE | LA_NLINK;
+			attr->la_mode = S_IFREG | 0400;
+			attr->la_nlink = 1;
+			return 0;
+		}
 		return -ENOENT;
+	}
 
 	down_read(&obj->oo_guard);
 	osd_inode_getattr(env, obj->oo_inode, obj->oo_dentry, attr);
@@ -375,6 +414,10 @@ static int osd_attr_to_xfs(const struct lu_attr *attr, struct xfs_osd_attr *xa)
 		if (!gid_valid(xa->gid))
 			return -EINVAL;
 	}
+	if (attr->la_valid & LA_PROJID) {
+		xa->valid |= XFS_OSD_SET_PROJID;
+		xa->projid = attr->la_projid;
+	}
 	if (attr->la_valid & LA_ATIME) {
 		xa->valid |= XFS_OSD_SET_ATIME;
 		xa->atime = (struct timespec64){ .tv_sec = attr->la_atime };
@@ -391,11 +434,13 @@ static int osd_attr_to_xfs(const struct lu_attr *attr, struct xfs_osd_attr *xa)
 }
 
 /*
- * One logged XFS transaction for mode, owner and times.
+ * One logged XFS transaction for mode, owner, project and times.
  *
  * mark_inode_dirty() is not enough on XFS: it has no ->dirty_inode or
  * ->write_inode, so fields written straight into the VFS inode reached disk
- * only if some later transaction happened to log that inode.
+ * only if some later transaction happened to log that inode. Ownership must
+ * also move the quota charge, which xfs_osd_setattr() does the way chown
+ * does; writing i_uid directly left every object charged to its creator.
  */
 static int osd_attr_set(const struct lu_env *env, struct dt_object *dt,
 			const struct lu_attr *attr, struct thandle *handle)
@@ -655,6 +700,12 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 		RETURN(-EOPNOTSUPP);
 	}
 
+	if (unlikely(fid_is_acct(fid))) {
+		CERROR("%s: refusing to create the virtual accounting object "
+		       DFID"\n", osd_name(osd), PFID(fid));
+		RETURN(-EPERM);
+	}
+
 	if (fid_is_igif(fid)) {
 		CERROR("%s: refusing to create an IGIF object "DFID
 		       ": IGIF names an inode that must already exist\n",
@@ -673,6 +724,7 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 		if (rc)
 			RETURN(rc);
 	}
+	xa.valid &= ~XFS_OSD_SET_PROJID;
 	osd_lma_build(env, fid, &lma);
 
 	if (osd_fid_is_on_ost(fid)) {
@@ -705,6 +757,17 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 		obj->oo_rec_len = 0;
 	}
 
+	/* The project id is not set at allocation; it is a separate update. */
+	if (attr != NULL && (attr->la_valid & LA_PROJID) &&
+	    attr->la_projid != 0) {
+		xa.valid = XFS_OSD_SET_PROJID;
+		xa.projid = attr->la_projid;
+		inode_lock(obj->oo_inode);
+		rc = xfs_osd_setattr(obj->oo_dentry, &xa);
+		inode_unlock(obj->oo_inode);
+		if (rc)
+			RETURN(rc);
+	}
 
 	osd_object_init0(obj);
 
@@ -746,6 +809,9 @@ static int osd_destroy(const struct lu_env *env, struct dt_object *dt,
 
 	if (!dt_object_exists(dt) || obj->oo_destroyed)
 		RETURN(-ENOENT);
+
+	if (unlikely(fid_is_acct(fid)))
+		RETURN(-EPERM);
 
 	osd_exec_op(env, th, OSD_OT_DESTROY, 0, 0);
 
@@ -913,6 +979,37 @@ static int osd_index_try(const struct lu_env *env, struct dt_object *dt,
 		return 0;
 	}
 
+	/*
+	 * Quota accounting is a *virtual* index: osd-ldiskfs and osd-zfs
+	 * synthesise it from the filesystem's own quota records rather than
+	 * storing it. Its shape (8-byte key, 16-byte record) matches the
+	 * generic key/value branch below, so falling through would hand back
+	 * a real but permanently empty index and `lfs quota` would report
+	 * every user as using nothing.
+	 *
+	 * Reporting zero usage is worse than reporting nothing: it looks like
+	 * an answer. Refuse it until osd-xfs can read XFS quota.
+	 */
+	/*
+	 * Quota accounting is a virtual index: the answers come from the
+	 * backing filesystem's own quota records, via sb->s_qcop. If the
+	 * filesystem was mounted without quota there is nothing to report, and
+	 * saying so is important -- the shape of this index matches the generic
+	 * key/value branch below, so falling through would hand back a real but
+	 * permanently empty index and lfs quota would report every user as
+	 * using nothing.
+	 */
+	if (feat == &dt_acct_features) {
+		if (!osd_acct_available(osd, lu_object_fid(&dt->do_lu))) {
+			CDEBUG(D_QUOTA,
+			       "%s: quota accounting unavailable: not enabled on the backing filesystem\n",
+			       osd_name(osd));
+			return -EOPNOTSUPP;
+		}
+		dt->do_index_ops = &osd_acct_index_ops;
+		return 0;
+	}
+
 	if (feat == &dt_directory_features) {
 		if (obj->oo_inode != NULL && !S_ISDIR(obj->oo_inode->i_mode))
 			return -ENOTDIR;
@@ -921,7 +1018,7 @@ static int osd_index_try(const struct lu_env *env, struct dt_object *dt,
 	}
 
 	/*
-	 * Generic key/value: FLD, nodemap, the llog name indexes.
+	 * Generic key/value: FLD, nodemap, quota, the llog name indexes.
 	 * Served by osd_kv_ops, one symlink per entry named hex(key) with
 	 * hex(record) as the body. See osd_index.c.
 	 *

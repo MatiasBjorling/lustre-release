@@ -431,7 +431,9 @@ int xfs_rename_fsname(struct mkfs_opts *mop, const char *oldname)
 
 int xfs_enable_quota(struct mkfs_opts *mop)
 {
-	fprintf(stderr, "%s: osd-xfs does not support quota\n", progname);
+	/* Accounting is enabled by osd_mount(); there is no offline toggle. */
+	fprintf(stderr, "%s: XFS quota accounting is enabled when osd-xfs mounts the target; --quota is not an offline XFS operation\n",
+		progname);
 	return -EOPNOTSUPP;
 }
 

@@ -725,13 +725,13 @@ const struct dt_index_operations osd_dir_ops = {
 /* ================================================================== */
 
 /*
- * FLD and nodemap are indexes with fixed-size binary keys and
+ * FLD, nodemap and the quota files are indexes with fixed-size binary keys and
  * records, not names. An XFS directory cannot store a binary key, so each
  * entry is a symlink whose *name* is the hex-encoded key and whose *body* is
  * the hex-encoded record.
  *
  * Why a symlink rather than a regular file: the record is at most 32 bytes
- * (the largest is union nodemap_rec), which hex-encodes to 64 characters
+ * (the largest is struct lquota_glb_rec), which hex-encodes to 64 characters
  * and lives inline in the inode. A regular file would cost a data block and a
  * separate read per lookup.
  *

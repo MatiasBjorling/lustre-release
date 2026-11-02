@@ -16,6 +16,7 @@
 
 #include <lustre_compat.h>
 #include <lustre_lfsck.h>
+#include <lustre_quota.h>
 #include <obd_class.h>
 #include <uapi/linux/lustre/lustre_param.h>
 
@@ -110,6 +111,22 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 	 * own.
 	 */
 	strncat(options, "attr2,inode64", PAGE_SIZE - 1);
+
+	/*
+	 * Quota accounting must be turned on at mount time on XFS -- unlike
+	 * ext4 there is no quota file to create at mkfs time, the accounting
+	 * lives in the filesystem's own metadata and is only maintained if
+	 * asked for at mount.
+	 *
+	 * Accounting only, not enforcement: Lustre enforces quota itself
+	 * through the quota slave device, using the OSD purely as the source
+	 * of "how much does this id own". Letting XFS enforce as well would
+	 * mean two independent limits, and the one that fired first would
+	 * return EDQUOT from underneath Lustre with no way to report which
+	 * limit was hit.
+	 */
+	strncat(options, ",uqnoenforce,gqnoenforce,pqnoenforce",
+		PAGE_SIZE - strlen(options) - 1);
 
 	/*
 	 * Pass backend options, including logbsize and logbufs, through to XFS.
@@ -365,6 +382,15 @@ static struct thandle *osd_trans_create(const struct lu_env *env,
 	INIT_LIST_HEAD(&oh->ot_commit_dcb_list);
 	INIT_LIST_HEAD(&oh->ot_stop_dcb_list);
 	INIT_LIST_HEAD(&oh->ot_commit_link);
+
+	/*
+	 * Where the quota reservations for this transaction are recorded.
+	 * qsd_op_begin() dereferences it without a NULL check, so it has to be
+	 * set here rather than lazily in the declare path.
+	 */
+	oh->ot_quota_trans = &osd_oti_get(env)->oti_quota_trans;
+	memset(oh->ot_quota_trans, 0, sizeof(*oh->ot_quota_trans));
+	oh->ot_id_cnt = 0;
 
 	RETURN(th);
 }
@@ -654,7 +680,13 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 
 	ENTRY;
 
-	/* Admission reservations must be released on every exit. */
+	/* Quota and admission reservations must be released on every exit. */
+	if (oh->ot_quota_trans != NULL) {
+		struct lquota_trans *qtrans = oh->ot_quota_trans;
+
+		oh->ot_quota_trans = NULL;
+		qsd_op_end(env, qtrans);
+	}
 	if (oh->ot_res_error && !th->th_result)
 		th->th_result = oh->ot_res_error;
 	for (i = 0; i < OSD_OT_MAX; i++)
@@ -788,6 +820,17 @@ static int osd_ro(const struct lu_env *env, struct dt_device *d)
 	return -EOPNOTSUPP;
 }
 
+/*
+ * Only the MDD reserves quota through this, never an OST. The op must exist:
+ * dt_reserve_or_free_quota() asserts it is non-NULL.
+ */
+static int osd_reserve_or_free_quota(const struct lu_env *env,
+				     struct dt_device *dev,
+				     struct lquota_id_info *qi)
+{
+	return -EOPNOTSUPP;
+}
+
 static struct vfsmount *osd_mnt_get(const struct dt_device *dev)
 {
 	struct osd_device *osd = osd_dt_dev(dev);
@@ -870,6 +913,7 @@ static const struct dt_device_operations osd_dt_ops = {
 	.dt_sync		  = osd_sync,
 	.dt_ro			  = osd_ro,
 	.dt_commit_async	  = osd_commit_async,
+	.dt_reserve_or_free_quota = osd_reserve_or_free_quota,
 	.dt_last_seq_get		  = osd_last_seq_get,
 };
 
@@ -881,6 +925,21 @@ static int osd_shutdown(const struct lu_env *env, struct osd_device *o)
 {
 	ENTRY;
 
+	/*
+	 * The quota slave must go here, on LCFG_CLEANUP, and not in
+	 * osd_device_fini(). It holds dt_object references for the accounting
+	 * objects, and by the time device_fini runs the layer above has
+	 * already torn down -- ofd_fini() then trips
+	 * ASSERTION(atomic_read(&d->ld_ref) == 0) and panics the OSS on
+	 * unmount. osd-ldiskfs releases it from its own osd_shutdown() for
+	 * the same reason.
+	 */
+	if (o->od_quota_slave_dt != NULL) {
+		struct qsd_instance *qsd = o->od_quota_slave_dt;
+
+		o->od_quota_slave_dt = NULL;
+		qsd_fini(env, qsd);
+	}
 
 	RETURN(0);
 }
@@ -912,6 +971,14 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	 * The *service* name (lustre-OST0000) comes from config argument 4,
 	 * not from argument 0, which is the device name and carries an "-osd"
 	 * suffix.
+	 *
+	 * This matters beyond cosmetics: qsd_prepare() derives the name of the
+	 * lightweight connection to the quota master with
+	 * tgt_name2lwp_name(od_svname). Given "lustre-OST0000-osd" it asks for
+	 * "lustre-MDT0000-lwp-OST0000-osd", which does not exist, so the quota
+	 * slave never reaches the master, reintegration never finishes and no
+	 * limit is ever enforced -- while accounting keeps working, so the
+	 * symptom is a quota that reports correctly and does nothing.
 	 */
 	svname = lustre_cfg_string(cfg, 4);
 	if (svname == NULL || svname[0] == '\0')
@@ -973,6 +1040,22 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	rc = osd_procfs_init(o, o->od_svname);
 	if (rc != 0)
 		CWARN("%s: tunables unavailable: rc = %d\n", name, rc);
+
+	/*
+	 * The quota slave. An OST needs only the dt instance; the md one is
+	 * for an MDT, which this backend does not implement. qsd_init()
+	 * returns NULL for a device that is neither, which is not an error.
+	 */
+	o->od_quota_slave_dt = qsd_init(env, o->od_svname, &o->od_dt_dev,
+					o->od_proc_entry, false, false);
+	if (IS_ERR(o->od_quota_slave_dt)) {
+		rc = PTR_ERR(o->od_quota_slave_dt);
+		o->od_quota_slave_dt = NULL;
+		CERROR("%s: cannot start the quota slave: rc = %d\n",
+		       name, rc);
+		RETURN(rc);
+	}
+	rc = 0;
 
 	RETURN(0);
 
@@ -1228,6 +1311,23 @@ static int osd_recovery_complete(const struct lu_env *env,
 	 */
 	osd_clear_virgin_marker(env, o);
 
+	/*
+	 * Start the quota slave now that recovery is done. Until qsd_start()
+	 * runs, qsd_op_begin() returns 0 for everything on its
+	 * "!qsd->qsd_started" fast path, so declares are made, reservations
+	 * are requested, and every one is granted: quota is reported correctly
+	 * and enforced not at all. A quiet failure, since the limits are
+	 * visible in quota_slave.limit_user and the accounting is right, while
+	 * writes sail straight past the limit.
+	 */
+	if (o->od_quota_slave_dt != NULL) {
+		int rc = qsd_start(env, o->od_quota_slave_dt);
+
+		if (rc != 0)
+			CERROR("%s: cannot start the quota slave: rc = %d\n",
+			       osd_name(o), rc);
+	}
+
 	return 0;
 }
 
@@ -1244,6 +1344,16 @@ static int osd_prepare(const struct lu_env *env, struct lu_device *pdev,
 	 * that never call the latter.
 	 */
 	osd_clear_virgin_marker(env, o);
+
+	if (o->od_quota_slave_dt != NULL) {
+		int rc = qsd_prepare(env, o->od_quota_slave_dt);
+
+		if (rc != 0) {
+			CERROR("%s: cannot prepare the quota slave: rc = %d\n",
+			       osd_name(o), rc);
+			return rc;
+		}
+	}
 
 	return 0;
 }

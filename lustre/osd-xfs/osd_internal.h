@@ -109,6 +109,9 @@
 #define OSD_COMMIT_DELAY_MS	25
 #define OSD_COMMIT_BATCH_MAX	32
 
+/* how many distinct quota ids one transaction may touch */
+#define OSD_MAX_UGID_CNT	32
+
 /*
  * Declared cost of each operation, in filesystem blocks and new inodes.
  *
@@ -324,6 +327,16 @@ struct osd_device {
 	 */
 	unsigned int		 od_commit_delay_ms;
 
+	/*
+	 * Quota slave device. Lustre enforces quota itself through this rather
+	 * than letting the backing filesystem do it, so the OSD mounts XFS
+	 * with accounting only (uqnoenforce et al) and serves the accounting
+	 * index from sb->s_qcop. Without a qsd instance nothing ever queries
+	 * that index and `lfs quota` reports its figures in brackets as
+	 * inaccurate.
+	 */
+	struct qsd_instance	*od_quota_slave_dt;
+
 	/* Advisory admission accounting, not an XFS allocation reservation. */
 	struct mutex		 od_res_lock;
 	atomic64_t		 od_res_blocks;
@@ -340,6 +353,12 @@ struct osd_device {
 	atomic64_t		 od_statfs_calls;
 	unsigned int		 od_declare_check:1;	/* warn on mismatch */
 
+	/*
+	 * procfs root for this target. Only needed because qsd_init() creates
+	 * its parameters under a proc_dir_entry; everything osd-xfs registers
+	 * itself lives in debugfs via dt_tunables_init().
+	 */
+	struct proc_dir_entry	*od_proc_entry;
 	/* how many transactions each log force covered, for lprocfs */
 	atomic64_t		 od_commit_forces;
 	atomic64_t		 od_commit_batched;
@@ -405,6 +424,20 @@ struct osd_thandle {
 	int			 ot_declare_ops[OSD_OT_MAX];
 	int			 ot_exec_ops[OSD_OT_MAX];
 	unsigned int		 ot_res_claimed:1;
+
+	/*
+	 * Quota ids this transaction has declared against, so qsd_op_end() can
+	 * release the reservations when it finishes. Points at the per-thread
+	 * oti_quota_trans; NULL once handed to trans_stop.
+	 */
+	struct lquota_trans	*ot_quota_trans;
+	/* ids already declared, to avoid declaring the same one twice */
+	struct osd_declared_qid {
+		union lquota_id	 oq_id;
+		short		 oq_type;
+		bool		 oq_blk;
+	}			 ot_id_array[OSD_MAX_UGID_CNT];
+	int			 ot_id_cnt;
 	struct list_head	 ot_commit_dcb_list;
 	struct list_head	 ot_stop_dcb_list;
 	unsigned int		 ot_started:1;
@@ -417,6 +450,10 @@ struct osd_thread_info {
 	char			 oti_name[64];
 
 	struct lustre_mdt_attrs	 oti_mdt_attrs;
+
+	/* quota: per-thread scratch for a declare, and the ids of one txn */
+	struct lquota_id_info	 oti_qi;
+	struct lquota_trans	 oti_quota_trans;
 };
 
 extern struct lu_context_key osd_key;
@@ -601,6 +638,16 @@ extern const struct dt_body_operations   osd_body_ops_new;
 extern const struct dt_index_operations  osd_dir_ops;
 extern const struct dt_index_operations  osd_kv_ops;
 extern const struct dt_index_operations  osd_otable_ops;
+extern const struct dt_index_operations  osd_acct_index_ops;
+
+/* quota: accounting via sb->s_qcop, project id via i_op->fileattr_* */
+bool osd_acct_available(struct osd_device *osd, const struct lu_fid *fid);
+int  osd_declare_inode_qid(const struct lu_env *env, qid_t uid, qid_t gid,
+			   __u32 projid, long long space,
+			   struct osd_thandle *oh, struct osd_object *obj,
+			   enum osd_quota_local_flags *local_flags, bool blk);
+__u32 osd_get_projid(struct inode *inode);
+int  osd_set_projid(struct inode *inode, __u32 projid);
 extern const struct lu_object_operations osd_lu_obj_ops;
 extern const struct lu_device_operations osd_lu_ops;
 

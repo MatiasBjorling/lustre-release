@@ -389,7 +389,7 @@ void osd_obj_map_fini(struct osd_device *dev)
  * OST data objects live at a path computed from the FID, so they need no
  * index. Everything else does. This mirrors the classification
  * fid_is_on_ost() makes in osd-ldiskfs/osd_oi.c, minus the FLD lookup: on an
- * OST, anything that is not explicitly a local/IGIF/llog FID is an OST
+ * OST, anything that is not explicitly a local/IGIF/llog/quota FID is an OST
  * object.
  */
 bool osd_fid_is_on_ost(const struct lu_fid *fid)
@@ -397,7 +397,7 @@ bool osd_fid_is_on_ost(const struct lu_fid *fid)
 	if (fid_is_idif(fid) || fid_is_last_id(fid))
 		return true;
 	if (fid_is_local_file(fid) || fid_is_igif(fid) ||
-	    fid_is_llog(fid) || fid_is_name_llog(fid))
+	    fid_is_llog(fid) || fid_is_name_llog(fid) || fid_is_quota(fid))
 		return false;
 	/* an ordinary OST object sequence */
 	return true;

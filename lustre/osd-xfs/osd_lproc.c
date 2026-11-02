@@ -404,10 +404,34 @@ int osd_procfs_init(struct osd_device *osd, const char *name)
 		RETURN(rc);
 	}
 
+	/*
+	 * qsd_init() registers the quota slave's parameters under a
+	 * proc_dir_entry, so one has to exist even though everything else this
+	 * backend exposes is in debugfs. Without it the quota slave works but
+	 * is invisible: no quota_slave.info, and no way to see or set its
+	 * state per target.
+	 */
+	if (osd->od_proc_entry == NULL) {
+		osd->od_proc_entry = lprocfs_register(name, type->typ_procroot,
+						      NULL, &osd->od_dt_dev);
+		if (IS_ERR(osd->od_proc_entry)) {
+			rc = PTR_ERR(osd->od_proc_entry);
+			CWARN("%s: no procfs entry, quota slave parameters will be missing: rc = %d\n",
+			      name, rc);
+			osd->od_proc_entry = NULL;
+			rc = 0;
+		}
+	}
+
 	RETURN(0);
 }
 
 void osd_procfs_fini(struct osd_device *osd)
 {
+	if (osd->od_proc_entry != NULL) {
+		lprocfs_remove(&osd->od_proc_entry);
+		osd->od_proc_entry = NULL;
+	}
+
 	dt_tunables_fini(&osd->od_dt_dev);
 }
