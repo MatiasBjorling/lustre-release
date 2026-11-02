@@ -1649,8 +1649,8 @@ static int osd_fallocate(const struct lu_env *env, struct dt_object *dt,
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
 		RETURN(-EOPNOTSUPP);
 	/*
-	 * -1 disables preallocation; see fallocate_zero_blocks. A punch still
-	 * works.
+	 * -1 disables preallocation; see fallocate_zero_blocks. It is set on a
+	 * zoned data device, which cannot preallocate but can punch.
 	 */
 	if (osd->od_fallocate_zero_blocks < 0 && !(mode & FALLOC_FL_PUNCH_HOLE))
 		RETURN(-EOPNOTSUPP);

@@ -478,6 +478,22 @@ static ssize_t fallocate_zero_blocks_show(struct kobject *kobj,
 	if (unlikely(osd->od_mnt == NULL))
 		return -EINPROGRESS;
 
+	/*
+	 * A zoned target cannot preallocate at all: every inode on a zoned
+	 * XFS is always-CoW and xfs_file_fallocate() refuses a preallocating
+	 * mode with -EOPNOTSUPP. Report that by failing the read rather than
+	 * printing a mode.
+	 *
+	 * The value matters because of how the test suite asks.
+	 * check_fallocate_supported() treats an unreadable parameter as "not
+	 * supported" and skips, which is the truth here; -1 is treated as
+	 * "unset" instead and makes check_set_fallocate() write a 0 back,
+	 * advertising a feature every call then rejects. Punch and
+	 * zero-range still work and go through osd_fallocate().
+	 */
+	if (osd->od_fallocate_zero_blocks < 0)
+		return -EOPNOTSUPP;
+
 	return scnprintf(buf, PAGE_SIZE, "%d\n",
 			 osd->od_fallocate_zero_blocks);
 }
@@ -501,6 +517,14 @@ static ssize_t fallocate_zero_blocks_store(struct kobject *kobj,
 
 	if (val < -1 || val > 1)
 		return -EINVAL;
+
+	/*
+	 * On a zoned target the mode is not a choice: preallocation is
+	 * impossible whatever it says, so refuse to pretend otherwise rather
+	 * than accept a value that every fallocate call then contradicts.
+	 */
+	if (osd->od_fallocate_zero_blocks < 0 && val >= 0)
+		return -EOPNOTSUPP;
 
 	osd->od_fallocate_zero_blocks = val;
 	return count;

@@ -65,6 +65,63 @@ struct lu_context_key osd_key = {
 /* mount / umount of the backing XFS filesystem                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Keep a reserve of free zones on a zoned target.
+ *
+ * XFS starts zone garbage collection only when free space falls to the open
+ * zone floor, because m_zonegc_low_space defaults to 0. That is fine for a
+ * filesystem with one writer and fatal for an OST: Lustre writes many objects
+ * at once, each wants its own open zone, and with all 127 permitted zones
+ * open a write that needs a new one gets -EIO from the drive rather than
+ * waiting. sanity 44f hits this on whichever target is most saturated, and
+ * the drive reports "Internal target failure" for a write that is at the
+ * write pointer and well inside the zone, which looks like failing hardware
+ * and is not: the drives pass SMART with no errors logged.
+ *
+ * Asking GC to start while a fraction of space is still free means zones are
+ * reclaimed before the limit is reached. The value is a percentage;
+ * OSD_ZONEGC_LOW_SPACE is 20, which cleared every one of the eleven targets.
+ *
+ * Set through sysfs because there is no mount option for it and the field is
+ * private to XFS. A failure here is not fatal: the target works, it is just
+ * liable to the -EIO above under a many-object write, so say so and continue.
+ */
+#define OSD_ZONEGC_LOW_SPACE "20"
+
+static void osd_zoned_set_gc_reserve(struct osd_device *o, const char *name,
+				     const char *dev)
+{
+	struct super_block *sb = osd_sb(o);
+	char path[64];
+	struct file *f;
+	loff_t pos = 0;
+	ssize_t rc;
+
+	/* The sysfs directory is named after the primary (metadata) device. */
+	if (sb == NULL || sb->s_bdev == NULL)
+		return;
+
+	snprintf(path, sizeof(path), "/sys/fs/xfs/%pg/zoned/zonegc_low_space",
+		 sb->s_bdev);
+
+	f = filp_open(path, O_WRONLY, 0);
+	if (IS_ERR(f)) {
+		CWARN("%s: no %s, so zone GC keeps no reserve: rc = %ld\n",
+		      name, path, PTR_ERR(f));
+		return;
+	}
+
+	rc = kernel_write(f, OSD_ZONEGC_LOW_SPACE,
+			  strlen(OSD_ZONEGC_LOW_SPACE), &pos);
+	filp_close(f, NULL);
+
+	if (rc < 0)
+		CWARN("%s: could not set %s: rc = %zd\n", name, path, rc);
+	else
+		LCONSOLE_INFO("%s: %s zone GC keeps %s%% free so a many-object write cannot exhaust the open zones\n",
+			      name, dev, OSD_ZONEGC_LOW_SPACE);
+}
+
 static int osd_mount(const struct lu_env *env, struct osd_device *o,
 		     struct lustre_cfg *cfg)
 {
@@ -181,6 +238,29 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 	} else {
 		o->od_writethrough_cache = 1;
 		o->od_read_cache = 1;
+	}
+
+	/*
+	 * A zoned target cannot preallocate.
+	 *
+	 * XFS treats every inode on a zoned filesystem as always-CoW, and
+	 * xfs_file_fallocate() refuses a preallocating mode on such an inode
+	 * with -EOPNOTSUPP: there is nowhere to put an unwritten extent when
+	 * every write has to go to the head of a sequential zone. Punch and
+	 * zero-range do work, and osd_fallocate() keeps handling those.
+	 *
+	 * Saying so up front matters because of how the test suite asks.
+	 * check_set_fallocate() reads fallocate_zero_blocks to decide whether
+	 * fallocate is available at all, and -1 is the value that means "not
+	 * supported", which makes sanity 150c through 150h and 101m skip
+	 * instead of failing. Leaving it at 0 advertises a feature the
+	 * filesystem will then reject on every call.
+	 */
+	if (bdev_is_zoned(osd_sb(o)->s_bdev)) {
+		o->od_fallocate_zero_blocks = -1;
+		LCONSOLE_INFO("%s: %s is zoned, so fallocate cannot preallocate; punch and zero-range still work\n",
+			      name, dev);
+		osd_zoned_set_gc_reserve(o, name, dev);
 	}
 
 	LCONSOLE_INFO("%s: mounted %s as an " OSD_XFS_NAME " target\n",
