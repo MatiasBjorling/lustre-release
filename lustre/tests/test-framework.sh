@@ -1367,7 +1367,7 @@ fs_log_size() {
 	local mult=$OSTCOUNT
 
 	case $(facet_fstype $facet) in
-		ldiskfs) size=32;; # largest seen is 64 with multiple OSTs
+		ldiskfs|xfs) size=32;; # largest seen is 64 with multiple OSTs
 		# grant_block_size is in bytes, allow at least 2x max blocksize
 		zfs)     size=$(lctl get_param osc.$FSNAME*.import |
 				awk '/grant_block_size:/ {print $2/512; exit;}')
@@ -1383,7 +1383,7 @@ fs_inode_ksize() {
 	local fstype=$(facet_fstype $facet)
 	local size=0
 	case $fstype in
-		ldiskfs) size=4;;  # ~4KB per inode
+		ldiskfs|xfs) size=4;;  # ~4KB per inode; osd-xfs uses -i size=1024
 		zfs)     size=11;; # 10 to 11KB per inode
 	esac
 
@@ -1891,6 +1891,60 @@ devicelabel() {
 	zfs)
 		label=$(do_facet ${facet} "$ZFS get -H -o value lustre:svname \
 		                           ${dev} 2>/dev/null");;
+	xfs)
+		# A persistent by-id path can differ from the OSD's canonical mntdev.
+		local resolved_dev=$(do_facet "$facet" "readlink -f '$dev'")
+		# An XFS superblock label is 12 bytes, too short to hold a full
+		# Lustre service name, so the authoritative name lives in
+		# CONFIGS/mountdata. Two readers, because neither works in
+		# both states: tunefs.lustre has to mount the target to read
+		# mountdata and so fails with EBUSY once it is up, while
+		# `lctl get_param` only knows about targets that ARE up.
+		#
+		# Callers pass either the bare device or the dm-flakey device
+		# layered on it, and mntdev reports whichever one the target
+		# was mounted from, so the two often disagree. A dm device and
+		# its backing device have different major:minor numbers, so
+		# resolve each mntdev through `dmsetup deps` and compare the
+		# backing device. Matching on device rather than name matters
+		# because a node hosts more than one target.
+		# Two simple remote commands, parsed locally. Nesting the
+		# resolution into one remote script needs three levels of
+		# quoting through do_facet and pdsh, and gets it wrong.
+		local _mntdevs=$(do_facet ${facet} \
+			"$LCTL get_param osd-*.*.mntdev 2>/dev/null")
+		local _deps=$(do_facet ${facet} \
+			"dmsetup deps -o devname 2>/dev/null")
+		label=$(MNT="$_mntdevs" DEPS="$_deps" DEV="$dev" RESOLVED_DEV="$resolved_dev" awk '
+			BEGIN {
+			    # "<name>: 1 dependencies : (vdb)" -> map
+			    n = split(ENVIRON["DEPS"], dl, "\n")
+			    for (i = 1; i <= n; i++) {
+			        if (match(dl[i], /^[^:]+:/) == 0) continue
+			        nm = substr(dl[i], 1, RLENGTH - 1)
+			        if (match(dl[i], /\(([^)]+)\)/) == 0) continue
+			        base["/dev/mapper/" nm] = "/dev/" \
+			            substr(dl[i], RSTART + 1, RLENGTH - 2)
+			    }
+			    n = split(ENVIRON["MNT"], ml, "\n")
+			    for (i = 1; i <= n; i++) {
+			        if (split(ml[i], kv, "=") != 2) continue
+			        d = kv[2]
+			        if (d != ENVIRON["DEV"] && d != ENVIRON["RESOLVED_DEV"] &&
+			            base[d] != ENVIRON["DEV"] && base[d] != ENVIRON["RESOLVED_DEV"])
+			            continue
+			        sub(/^osd-[^.]*\./, "", kv[1])
+			        sub(/\.mntdev$/, "", kv[1])
+			        print kv[1]
+			        exit
+			    }
+			}')
+		label=${label%-osd}
+		# The awk runs locally, on do_facet's output, so its field
+		# references survive expansion.
+		[[ -n "$label" ]] || label=$(do_facet ${facet} \
+			"$TUNEFS --dryrun ${dev} 2>/dev/null" |
+			awk '/^Target:/ { print $2; exit }');;
 	wbcfs)
 		label="wbcfs-target";;
 	*)
@@ -2452,18 +2506,36 @@ dm_set_dev_table() {
 }
 
 #
-# Set a device-mapper flakey device as "read-only" by using the "drop_writes"
-# feature parameter.
+# Verify that the mounted OSD actually uses the fault-injection mapping.
 #
-# drop_writes:
-#	All write I/O is silently ignored.
-#	Read I/O is handled correctly.
-#
+dm_assert_active_backing() {
+	local facet=$1
+	local dm_dev=${2:-$(dm_facet_devpath $facet)}
+
+	# The mapping may exist while the OSD was mounted on its raw backing
+	# device. Injecting into that unused mapping silently tests nothing.
+	local svc=${facet}_svc
+	local fstype=$(facet_fstype "$facet")
+	local mounted
+
+	mounted=$(do_facet "$facet" "$LCTL get_param -n osd-$fstype.${!svc}.mntdev") ||
+		{ error "cannot determine active OSD device for $facet"; return 1; }
+	do_facet_vp "$facet" bash -c '
+		test -b "$1" && test -b "$2" &&
+		test "$(stat -Lc "%t:%T" "$1")" = "$(stat -Lc "%t:%T" "$2")" &&
+		"$3" table "$2" | awk '\''NF { n++; if ($3 != "linear" && $3 != "flakey") bad=1 } END { exit n != 1 || bad }'\''
+	' guard "$mounted" "$dm_dev" "$DMSETUP" ||
+		{ error "$facet: fault mapping $dm_dev is not the active OSD device ($mounted)"; return 1; }
+
+}
+
+# Drop writes only after proving the mapping is the active OSD device.
 dm_set_dev_readonly() {
 	local facet=$1
 	local dm_dev=${2:-$(dm_facet_devpath $facet)}
 
-	dm_set_dev_table $facet $dm_dev flakey
+	dm_assert_active_backing "$facet" "$dm_dev" || return 1
+	dm_set_dev_table "$facet" "$dm_dev" flakey
 }
 
 #
@@ -2483,6 +2555,10 @@ set_dev_readonly() {
 	local facet=$1
 	local svc=${facet}_svc
 
+	if [[ $(facet_fstype $facet) = xfs ]] && ! dm_flakey_supported "$facet"; then
+		error "$facet: XFS fault injection requires active dm-flakey backing"
+		return 1
+	fi
 	if [[ $(facet_fstype $facet) = zfs ]] ||
 	   ! dm_flakey_supported $facet; then
 		do_facet $facet $LCTL --device ${!svc} readonly
@@ -2673,6 +2749,20 @@ mount_facet() {
 
 		devicelabel=$(do_facet ${facet} "$ZFS get -H -o value \
 						lustre:svname $dm_dev");;
+	xfs)
+		# Same dm-flakey handling as ldiskfs: osd-xfs targets are real
+		# block devices, so the fault-injection tests apply equally.
+		if dm_flakey_supported $facet; then
+			dm_dev=$(dm_create_dev $facet ${!dev})
+			[[ -n "$dm_dev" ]] || dm_dev=${!dev}
+		else
+			# Match the canonical device name reported by osd-xfs mntdev.
+			dm_dev=$(do_facet "$facet" "readlink -f '$dm_dev'") || return
+		fi
+
+		is_blkdev $facet $dm_dev || opts=$(csa_add "$opts" -o loop)
+
+		devicelabel=$(devicelabel $facet $dm_dev);;
 	wbcfs)
 		:;;
 	*)
@@ -2762,6 +2852,22 @@ mount_facet() {
 				grep -E ':[a-zA-Z]{3}[0-9]{4}'" "" ||
 				error "$dm_dev failed to initialize!";;
 
+		xfs)
+			# The ldiskfs and zfs checks above wait for the label
+			# to gain the ":OSTxxxx" suffix that registration
+			# writes. osd-xfs keeps the service name in
+			# CONFIGS/mountdata rather than the 12-byte XFS label,
+			# so wait for THIS target to come up instead.
+			#
+			# Keyed on the device, not on $devicelabel: that was
+			# read before the mount, when the target was down and
+			# there was nothing to read, so it is empty here. A
+			# node hosts more than one target, so the device is
+			# what distinguishes them.
+			wait_update_facet ${facet} "$LCTL get_param -n \
+				osd-*.*.mntdev 2>/dev/null |
+				grep -cx -- '$dm_dev'" "1" ||
+				error "$dm_dev failed to initialize!";;
 		wbcfs)
 			:;;
 		*)
@@ -5232,7 +5338,7 @@ ostdevname() {
 	local fstype=$(facet_fstype ost$num)
 
 	case $fstype in
-		ldiskfs )
+		ldiskfs|xfs )
 			local dev=ost${num}_dev
 			[[ -n ${!dev} ]] && eval DEVPTR=${!dev} ||
 			#if $OSTDEVn isn't defined, default is $OSTDEVBASE + num
@@ -5259,7 +5365,7 @@ ostvdevname() {
 	local fstype=$(facet_fstype ost$num)
 
 	case $fstype in
-		ldiskfs )
+		ldiskfs|xfs )
 			# vdevs are not supported by ldiskfs
 			eval VDEVPTR="";;
 		zfs )
@@ -5284,7 +5390,7 @@ mdsdevname() {
 	local fstype=$(facet_fstype mds$num)
 
 	case $fstype in
-		ldiskfs )
+		ldiskfs|xfs )
 			local dev=mds${num}_dev
 			[[ -n ${!dev} ]] && eval DEVPTR=${!dev} ||
 			#if $MDSDEVn isn't defined, default is $MDSDEVBASE{n}
@@ -5309,7 +5415,7 @@ mdsvdevname() {
 	local fstype=$(facet_fstype mds$num)
 
 	case $fstype in
-		ldiskfs )
+		ldiskfs|xfs )
 			# vdevs are not supported by ldiskfs
 			eval VDEVPTR="";;
 		zfs )
@@ -5331,7 +5437,7 @@ mgsdevname() {
 	local fstype=$(facet_fstype mgs)
 
 	case $fstype in
-	ldiskfs )
+	ldiskfs|xfs )
 		if [ $(facet_host mgs) = $(facet_host mds1) ] &&
 		   ( [ -z "$MGSDEV" ] || [ $MGSDEV = $MDSDEV1 ] ); then
 			DEVPTR=$(mdsdevname 1)
@@ -5362,7 +5468,7 @@ mgsvdevname() {
 	local fstype=$(facet_fstype mgs)
 
 	case $fstype in
-	ldiskfs )
+	ldiskfs|xfs )
 		# vdevs are not supported by ldiskfs
 		;;
 	zfs )
@@ -5412,6 +5518,39 @@ mount_ldiskfs() {
 unmount_ldiskfs() {
 	local facet=$1
 	local dev=$(facet_device $facet)
+	local mnt=${2:-$(facet_mntpt $facet)}
+
+	do_facet $facet $UMOUNT $mnt
+}
+
+# Mount an osd-xfs target's backing filesystem directly, without Lustre. Used
+# by check_seq_oid() and friends to read an object's trusted.fid xattr with
+# ll_decode_filter_fid: there is no xfs equivalent of debugfs that can do it
+# on an unmounted device, so the generic mount/decode/unmount path is the only
+# route. Mirrors mount_ldiskfs(), including dm-flakey, because an osd-xfs
+# target is an ordinary block device too.
+mount_xfs() {
+	local facet=$1
+	local dev=$(facet_device $facet)
+	local mnt=${2:-$(facet_mntpt $facet)}
+	local opts
+	local dm_dev=$dev
+
+	if dm_flakey_supported $facet; then
+		dm_dev=$(dm_create_dev $facet $dev)
+		[[ -n "$dm_dev" ]] || dm_dev=$dev
+	fi
+	is_blkdev $facet $dm_dev || opts=$(csa_add "$opts" -o loop)
+	export_dm_dev $facet $dm_dev
+
+	do_facet $facet "mkdir -p $mnt"
+	# nouuid: the Lustre mount may still have the same filesystem UUID
+	# registered, and XFS refuses a second mount of a duplicate UUID.
+	do_facet $facet mount -t xfs -o nouuid $opts $dm_dev $mnt
+}
+
+unmount_xfs() {
+	local facet=$1
 	local mnt=${2:-$(facet_mntpt $facet)}
 
 	do_facet $facet $UMOUNT $mnt
@@ -5746,7 +5885,8 @@ __touch_device()
 	local device
 
 	case "$(facet_fstype $facet)" in
-	ldiskfs)
+	ldiskfs|xfs)
+		# Both are plain block devices named by ${facet_type}devname.
 		device=$(${facet_type}devname $facet_num)
 		;;
 	zfs)

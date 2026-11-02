@@ -337,6 +337,8 @@ restart:
 		__u64 last_seq;
 
 		rc = dt_last_seq_get(env, seq->lss_dev, &last_seq);
+		if (rc && seq->lss_dev->dd_ops->dt_last_seq_get)
+			RETURN(rc);
 		if (!rc) {
 			if (last_seq + 1 >= space->lsr_end) {
 				LCONSOLE_INFO("%s: On disk last known sequence %#llx beyond super-sequence "

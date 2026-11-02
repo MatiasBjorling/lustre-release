@@ -1,0 +1,467 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * This file is part of Lustre, http://www.lustre.org/
+ *
+ * Internal definitions for the XFS OSD (osd-xfs).
+ *
+ * osd-xfs backs Lustre OSTs with an unmodified in-kernel XFS filesystem.
+ *
+ * Two findings from the design study shape this module, and both are worth
+ * restating here because they are why the OST path is tractable at all:
+ *
+ *  1. On an OST, Lustre never looks an object up through a b-tree object
+ *     index. osd_oi_lookup() in osd-ldiskfs dispatches every OST-side FID to
+ *     the O/<seq>/d<N>/<oid> *directory* hierarchy, and the directory entries
+ *     it creates carry no FID payload. So osd-xfs needs no IAM port and, more
+ *     importantly, no change to the XFS on-disk directory format.
+ *
+ *  2. The only xattrs an OST object carries are trusted.lma (24 bytes) and
+ *     trusted.fid (at most 56). Formatted with -i size=1024 they both live in
+ *     the shortform attribute fork, so XFS never has to spill to a remote
+ *     attribute block and never has to roll a transaction to set one.
+ *
+ * Transactions. Crash consistency comes from the XFS log, in two parts:
+ *
+ *  - An object is created with its identity in one XFS transaction:
+ *    xfs_osd_create() logs the inode, its directory entry, trusted.lma and
+ *    its initial mode, owner and times together. attr_set is likewise one
+ *    logged transaction (xfs_osd_setattr()).
+ *
+ *  - Everything else is ordered, not grouped. XFS log recovery replays a
+ *    prefix of committed transactions, so a transaction committed later is
+ *    never recovered without the ones before it. Each dt operation commits
+ *    its own XFS transactions in program order. trans_stop writes back the
+ *    pages the transaction wrote through the page cache and forces the log
+ *    before the commit callbacks run, so nothing is reported durable before
+ *    it is.
+ *
+ * See analysis/06-compound-transactions.md in the project for the audit.
+ */
+
+#ifndef _OSD_XFS_INTERNAL_H
+#define _OSD_XFS_INTERNAL_H
+
+#include <linux/dcache.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/mount.h>
+#include <linux/rwsem.h>
+#include <linux/statfs.h>
+#include <linux/xattr.h>
+
+#include <lustre_compat/linux/fs.h>
+
+#include <dt_object.h>
+#include <lustre_disk.h>
+#include <lustre_fid.h>
+#include <obd.h>
+#include <obd_class.h>
+
+#include <linux/xfs_osd.h>
+
+#define OSD_XFS_NAME		"osd-xfs"
+
+/* backing filesystem type we vfs_kern_mount() */
+#define OSD_XFS_FSTYPE		"xfs"
+
+/*
+ * Number of d<N> subdirectories under each O/<seq>/. Must be a power of two:
+ * the object id is masked, not divided. Matches the ldiskfs default so that a
+ * target laid out by either OSD looks the same to an administrator.
+ */
+#define OSD_XFS_SUBDIR_COUNT	32
+
+/* the object index directory, immediately below the filesystem root */
+#define OSD_OI_DIRNAME		"oi"
+
+/*
+ * Caps for the key/value index flavour. A key hex-encodes into a filename
+ * (NAME_MAX is 255, so 64 bytes is comfortable) and a record hex-encodes into
+ * a symlink body.
+ */
+#define OSD_KV_KEY_MAX		64
+#define OSD_KV_REC_MAX		128
+
+/*
+ * XFS limits we need but which live in fs/xfs private headers, so they are not
+ * reachable from a module. Kept here with the upstream source of each value so
+ * they can be checked when the kernel moves.
+ *
+ *   XFS_MAXLINK           fs/xfs/libxfs/xfs_format.h
+ *   XFS_XATTR_SIZE_MAX    fs/xfs/libxfs/xfs_format.h  (1 << 16)
+ */
+#ifndef XFS_MAXLINK
+#define XFS_MAXLINK		((1U << 31) - 1U)
+#endif
+#ifndef XFS_XATTR_SIZE_MAX
+#define XFS_XATTR_SIZE_MAX	(1 << 16)
+#endif
+
+/*
+ * Largest single object size advertised to clients.
+ *
+ * XFS's own s_maxbytes is 8 EiB, the format limit. Advertising that is wrong
+ * twice over: a 2-stripe write lands within a byte of MAX_LFS_FILESIZE and
+ * fails with EFBIG, and clients take the figure literally.
+ *
+ * The value has to match what osd-ldiskfs reports, not merely be close to
+ * it. ext4_max_size() gives 2^44 minus one filesystem block, and a client
+ * writing a file striped across both backends uses the smallest limit among
+ * its OSTs: advertising the round 2^44 made sanity 44c seek one block past
+ * what the ldiskfs OSTs accept, and the write failed with EINVAL on
+ * whichever OST the round robin happened to pick.
+ */
+#define OSD_XFS_MAX_OBJECT_BYTES(blocksize)	\
+	((((loff_t)1 << 44) - (blocksize)))
+
+struct osd_device;
+
+/* ------------------------------------------------------------------ */
+
+struct osd_object {
+	struct dt_object	 oo_dt;
+
+	/* pinned for the lifetime of the osd_object */
+	struct inode		*oo_inode;
+	/*
+	 * Dentry for the object's entry in the O/ tree. Objects reached only
+	 * by FID (never linked into a directory) leave this NULL.
+	 */
+	struct dentry		*oo_dentry;
+
+	struct rw_semaphore	 oo_guard;
+	/* serialises attribute and xattr updates against readers */
+	struct rw_semaphore	 oo_ext_guard;
+
+	unsigned int		 oo_destroyed:1;
+
+	/*
+	 * Key and record sizes for a fixed-size binary index, latched by
+	 * osd_index_try(). Zero for a directory (name) index.
+	 */
+	__u16			 oo_keysize;
+	__u16			 oo_recsize;
+	/* key is a NUL-terminated string bounded by oo_keysize */
+	unsigned int		 oo_varkey:1;
+};
+
+/*
+ * Cached state for one OST object sequence, i.e. one O/<seq>/ subtree.
+ * Looked up on the FID fast path, so kept small.
+ */
+struct osd_obj_seq {
+	struct list_head	 oos_seq_list;
+	u64			 oos_seq;
+	struct dentry		*oos_root;	/* O/<seq> */
+	struct dentry	       **oos_dirs;	/* O/<seq>/d0..dN-1 */
+	int			 oos_subdir_count;
+};
+
+struct osd_obj_map {
+	struct dentry		*om_root;	/* O/ */
+	struct list_head	 om_seq_list;
+	struct rw_semaphore	 om_sem;
+	int			 om_subdir_count;
+};
+
+/*
+ * The object index for objects that are NOT OST data objects.
+ *
+ * OST data objects (IDIF and the OST sequences) are found by deriving their
+ * path from the FID, so they need no index at all. Everything else -- the
+ * target's local named objects, last_rcvd, reply_data, the llog catalogs, the
+ * CONFIGS directory -- lives at an arbitrary place in the namespace and must
+ * be reachable by FID.
+ *
+ * Implementation: a flat directory of symlinks, "oi/<seq>:<oid>:<ver>", whose
+ * link body is "<ino>:<gen>". Lookup reads the link and turns the pair into a
+ * dentry with the filesystem's own NFS export operation, which validates the
+ * generation for us and so detects inode reuse. Rename does not change an
+ * inode number, so an OI entry stays valid when an object is bound into the
+ * namespace under its name.
+ *
+ * This is deliberately not a b-tree. An OST has a few hundred such objects,
+ * XFS directories are already b-trees, and a symlink body is a cheap way to
+ * store 12 bytes without needing a block-mapped index file.
+ */
+struct osd_oi {
+	struct dentry		*oi_root;	/* oi/ */
+	struct dentry		*oi_stage;	/* oi/stage/ */
+};
+
+struct osd_device {
+	struct dt_device	 od_dt_dev;
+
+	struct vfsmount		*od_mnt;
+	char			 od_mntdev[MAX_OBD_NAME];
+	char			 od_svname[MAX_OBD_NAME];
+
+	atomic_t		 od_connects;
+	struct lu_site		 od_site;
+
+	/* Sticky durability errors serialize with successful commit callbacks. */
+	struct mutex		 od_durability_lock;
+	/* Hook outcome precedes successful callback visibility. */
+	struct mutex		 od_publish_lock;
+	int			 od_durability_error;
+
+	unsigned int		 od_flush_buffered:1;
+
+	/* FID -> object mapping: the O/ directory tree, for OST data objects */
+	struct osd_obj_map	*od_ost_map;
+	/* FID -> object mapping for everything else */
+	struct osd_oi		*od_oi;
+
+	/* root of the backing filesystem */
+	struct dentry		*od_root_dentry;
+	struct lu_fid		 od_root_fid;
+};
+
+/*
+ * OSD transaction state. A dt transaction is a sequence of XFS transactions,
+ * ordered; see the comment at the top of this file.
+ */
+struct osd_thandle {
+	struct thandle		 ot_super;
+	/* why trans_start refused, returned again by trans_stop */
+	int			 ot_start_error;
+
+	/*
+	 * Inodes this transaction wrote with buffered I/O, so trans_stop can
+	 * get that data onto stable storage. Almost always one (last_rcvd);
+	 * the array avoids an allocation for the common case and anything
+	 * beyond it falls back to flushing the whole filesystem.
+	 */
+#define OSD_TH_MAX_DIRTY	16
+	struct inode		*ot_dirty[OSD_TH_MAX_DIRTY];
+	int			 ot_ndirty;
+	unsigned int		 ot_dirty_overflow:1;
+
+	/* an execute method ran, so recovery publication is owed */
+	unsigned int		 ot_mutated:1;
+	struct list_head	 ot_commit_dcb_list;
+	struct list_head	 ot_stop_dcb_list;
+	unsigned int		 ot_started:1;
+};
+
+struct osd_thread_info {
+	struct ost_id		 oti_ostid;
+
+	/* scratch space for building O/<seq>/dN/<oid> names */
+	char			 oti_name[64];
+
+	struct lustre_mdt_attrs	 oti_mdt_attrs;
+};
+
+extern struct lu_context_key osd_key;
+
+static inline struct osd_thread_info *osd_oti_get(const struct lu_env *env)
+{
+	return lu_context_key_get(&env->le_ctx, &osd_key);
+}
+
+/* ------------------------------------------------------------------ */
+/* container_of helpers                                               */
+/* ------------------------------------------------------------------ */
+
+static inline struct osd_device *osd_dt_dev(const struct dt_device *d)
+{
+	return container_of_safe(d, struct osd_device, od_dt_dev);
+}
+
+static inline struct osd_device *osd_dev(const struct lu_device *d)
+{
+	return osd_dt_dev(container_of_safe(d, struct dt_device, dd_lu_dev));
+}
+
+static inline struct osd_object *osd_obj(const struct lu_object *o)
+{
+	return container_of_safe(o, struct osd_object, oo_dt.do_lu);
+}
+
+static inline struct osd_object *osd_dt_obj(const struct dt_object *d)
+{
+	return osd_obj(&d->do_lu);
+}
+
+static inline struct osd_device *osd_obj2dev(const struct osd_object *o)
+{
+	return osd_dev(o->oo_dt.do_lu.lo_dev);
+}
+
+static inline struct super_block *osd_sb(const struct osd_device *dev)
+{
+	return dev->od_mnt ? dev->od_mnt->mnt_sb : NULL;
+}
+
+static inline struct lu_device *osd2lu_dev(struct osd_device *osd)
+{
+	return &osd->od_dt_dev.dd_lu_dev;
+}
+
+static inline char *osd_name(struct osd_device *osd)
+{
+	return osd->od_dt_dev.dd_lu_dev.ld_obd->obd_name;
+}
+
+static inline struct osd_thandle *osd_thandle(struct thandle *th)
+{
+	return container_of_safe(th, struct osd_thandle, ot_super);
+}
+
+/* Note that @th changed something, so trans_stop must publish it. */
+static inline void osd_trans_mutated(struct thandle *th)
+{
+	if (th != NULL)
+		osd_thandle(th)->ot_mutated = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* osd_oi.c - the O/<seq>/dN/<oid> object map                          */
+/* ------------------------------------------------------------------ */
+
+int  osd_obj_map_init(const struct lu_env *env, struct osd_device *dev);
+void osd_obj_map_fini(struct osd_device *dev);
+int  osd_obj_map_lookup(const struct lu_env *env, struct osd_device *dev,
+			const struct lu_fid *fid, struct dentry **dentry);
+int  osd_obj_map_create(const struct lu_env *env, struct osd_device *dev,
+			const struct lu_fid *fid, umode_t mode,
+			const struct xfs_osd_attr *attr,
+			const struct xfs_osd_xattr *xattrs, unsigned int nr,
+			struct dentry **dentry);
+int  osd_obj_map_delete(const struct lu_env *env, struct osd_device *dev,
+			const struct lu_fid *fid);
+
+/*
+ * Batched directory reader.
+ *
+ * A readdir actor that returns false is telling the filesystem "I did not take
+ * that entry", so the filesystem leaves its position on it. Emitting one entry
+ * per iterate_dir() call therefore re-reads the same entry forever -- which
+ * hung the mount inside llog_process_thread with the CPU pinned. The actor
+ * must consume entries and return true, and stop only when the batch is full.
+ */
+#define OSD_DIR_BATCH	32
+
+struct osd_dir_ent {
+	u64		de_ino;
+	u64		de_off;		/* this entry's own offset */
+	int		de_namelen;
+	unsigned int	de_type;
+	char		de_name[NAME_MAX + 1];
+};
+
+struct osd_dir_reader {
+	struct file		*dr_file;
+	struct osd_dir_ent	*dr_ents;
+	int			 dr_nents;
+	int			 dr_cur;
+};
+
+int  osd_dir_reader_init(struct osd_dir_reader *r, struct osd_device *osd,
+			 struct dentry *dentry);
+void osd_dir_reader_fini(struct osd_dir_reader *r);
+/* 0 = *ent valid, 1 = end of directory, <0 = error */
+int  osd_dir_reader_next(struct osd_dir_reader *r, struct osd_dir_ent **ent);
+void osd_dir_reader_seek(struct osd_dir_reader *r, loff_t pos);
+
+/* read a symlink body into a kernel buffer (NOT vfs_readlink: that is
+ * the readlink(2) backend and copies to userspace) */
+int  osd_readlink_str(struct dentry *link, char *buf, size_t len);
+
+
+/* empty a directory so it can be rmdir'd (an index being destroyed) */
+int  osd_purge_dir(struct osd_device *osd, struct dentry *dir, int depth);
+#define osd_purge_index_dir(osd, d)	osd_purge_dir((osd), (d), 0)
+
+/* true when the FID's location can be derived from the FID itself */
+bool osd_fid_is_on_ost(const struct lu_fid *fid);
+
+/* the oi/ symlink index, for everything whose path cannot be derived */
+int  osd_oi_init(const struct lu_env *env, struct osd_device *dev);
+void osd_oi_fini(struct osd_device *dev);
+struct dentry *osd_lookup_or_mkdir(struct osd_device *dev,
+				   struct dentry *parent, const char *name,
+				   bool create);
+
+int osd_commit_error(struct osd_device *osd, int error);
+void osd_trans_note_dirty(struct thandle *th, struct inode *inode);
+void osd_trans_drop_dirty(struct osd_thandle *oh);
+bool osd_trans_writeback_dirty(const struct lu_env *env,
+			       struct osd_device *osd,
+			       struct osd_thandle *oh, int *rcp);
+
+int  osd_oi_lookup(const struct lu_env *env, struct osd_device *dev,
+		   const struct lu_fid *fid, struct dentry **dentry);
+int  osd_oi_insert(const struct lu_env *env, struct osd_device *dev,
+		   const struct lu_fid *fid, struct inode *inode);
+int  osd_oi_delete(const struct lu_env *env, struct osd_device *dev,
+		   const struct lu_fid *fid);
+
+/* unified entry point: dispatches on osd_fid_is_on_ost() */
+int  osd_fid_lookup(const struct lu_env *env, struct osd_device *dev,
+		    const struct lu_fid *fid, struct dentry **dentry);
+
+/* create an object in oi/stage/, to be bound into the namespace by dio_insert */
+int  osd_stage_create(const struct lu_env *env, struct osd_device *dev,
+		      const struct lu_fid *fid, umode_t mode,
+		      const struct xfs_osd_attr *attr,
+		      const struct xfs_osd_xattr *xattrs, unsigned int nr,
+		      struct dentry **dentry);
+/* move a staged object to <parent>/<name> */
+int  osd_stage_bind(const struct lu_env *env, struct osd_device *dev,
+		    struct dentry *parent, const char *name,
+		    struct dentry *staged);
+
+/* ------------------------------------------------------------------ */
+/* osd_object.c                                                        */
+/* ------------------------------------------------------------------ */
+
+extern const struct dt_object_operations osd_obj_ops;
+extern const struct dt_body_operations   osd_body_ops;
+extern const struct dt_body_operations   osd_body_ops_new;
+extern const struct dt_index_operations  osd_dir_ops;
+extern const struct dt_index_operations  osd_kv_ops;
+extern const struct dt_index_operations  osd_otable_ops;
+extern const struct lu_object_operations osd_lu_obj_ops;
+extern const struct lu_device_operations osd_lu_ops;
+
+struct kmem_cache *osd_xfs_object_cachep(void);
+
+struct lu_object *osd_object_alloc(const struct lu_env *env,
+				   const struct lu_object_header *hdr,
+				   struct lu_device *d);
+
+int osd_lma_get(const struct lu_env *env, struct inode *inode,
+		struct lu_fid *fid);
+void osd_lma_build(const struct lu_env *env, const struct lu_fid *fid,
+		   struct xfs_osd_xattr *xattr);
+
+/* ------------------------------------------------------------------ */
+/* osd_lproc.c                                                         */
+/* ------------------------------------------------------------------ */
+
+int  osd_procfs_init(struct osd_device *osd, const char *name);
+void osd_procfs_fini(struct osd_device *osd);
+int osd_process_param(struct osd_device *osd, struct lustre_cfg *cfg);
+
+/* ------------------------------------------------------------------ */
+/* misc                                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Lustre owns the externally visible timestamps. Mark backing inodes
+ * S_NOCMTIME so incidental VFS activity does not move them.
+ *
+ * This only suppresses the VFS-level updates. xfs_trans_ichgtime() is called
+ * unconditionally from XFS's own directory and attribute helpers, so setting
+ * an xattr still moves ctime.
+ */
+static inline void osd_set_nocmtime(struct inode *inode)
+{
+	if (inode)
+		inode->i_flags |= S_NOCMTIME;
+}
+
+#endif /* _OSD_XFS_INTERNAL_H */

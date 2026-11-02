@@ -12,4 +12,5 @@ obj-$(CONFIG_LUSTRE_FS_SERVER) += target/ osd-wbcfs/
 obj-$(CONFIG_LUSTRE_FS) += lov/ osc/ mdc/ lmv/ llite/ fld/
 obj-$(CONFIG_LUSTRE_FS_LDISKFS) += osd-ldiskfs/
 obj-$(CONFIG_LUSTRE_FS_ZFS) += osd-zfs/
+obj-$(CONFIG_LUSTRE_FS_XFS) += osd-xfs/
 
