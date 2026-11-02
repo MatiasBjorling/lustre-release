@@ -31,10 +31,11 @@
  *  - Everything else is ordered, not grouped. XFS log recovery replays a
  *    prefix of committed transactions, so a transaction committed later is
  *    never recovered without the ones before it. Each dt operation commits
- *    its own XFS transactions in program order. trans_stop writes back the
- *    pages the transaction wrote through the page cache and forces the log
- *    before the commit callbacks run, so nothing is reported durable before
- *    it is.
+ *    its own XFS transactions in program order, data is made durable before
+ *    the transaction that publishes it, and the recovery records (last_rcvd,
+ *    LAST_ID) are logged xattrs written last, at trans_stop. A crash can
+ *    therefore leave effects without their record, which Lustre replays, but
+ *    never a record without its effects.
  *
  * See analysis/06-compound-transactions.md in the project for the audit.
  */
@@ -154,6 +155,18 @@ struct osd_object {
 	struct rw_semaphore	 oo_guard;
 	/* serialises attribute and xattr updates against readers */
 	struct rw_semaphore	 oo_ext_guard;
+	/* Serializes logged-record RMW, mirror updates, and truncation. */
+	struct mutex		 oo_rec_lock;
+	bool			 oo_rec_ready;
+	/*
+	 * Small records (LAST_ID): the current value, which readers see at
+	 * once, and whether it still has to be logged. See osd_rec_small().
+	 */
+#define OSD_REC_SMALL_MAX	16
+	bool			 oo_rec_cached;
+	bool			 oo_rec_dirty;
+	u8			 oo_rec_len;
+	u8			 oo_rec_val[OSD_REC_SMALL_MAX];
 
 	unsigned int		 oo_destroyed:1;
 
@@ -282,6 +295,17 @@ struct osd_device {
 struct osd_thandle {
 	struct thandle		 ot_super;
 	int			 ot_res_error;
+
+	/*
+	 * Small records (LAST_ID) this transaction wrote. They are logged at
+	 * trans_stop, after every effect of the transaction. Precreate writes
+	 * LAST_ID before its creates; logging it then would let a crash keep
+	 * a LAST_ID covering objects that were never created, which nothing
+	 * repairs.
+	 */
+#define OSD_TH_MAX_DEFER	4
+	struct osd_object	*ot_defer[OSD_TH_MAX_DEFER];
+	int			 ot_ndefer;
 
 	/*
 	 * Inodes this transaction wrote with buffered I/O, so trans_stop can
@@ -448,6 +472,13 @@ int  osd_reserve_claim(const struct lu_env *env, struct osd_device *osd,
 void osd_reserve_release(struct osd_device *osd, struct osd_thandle *oh);
 void osd_reserve_init(struct osd_device *osd);
 int osd_commit_error(struct osd_device *osd, int error);
+int osd_force_log(struct osd_device *osd);
+bool osd_rec_logged(const struct osd_object *obj);
+bool osd_rec_small(const struct osd_object *obj);
+int osd_rec_small_load(const struct lu_env *env, struct osd_object *obj);
+int osd_rec_resize(struct osd_object *obj, u64 size);
+int osd_rec_recover(struct osd_object *obj);
+int osd_rec_defer_flush(const struct lu_env *env, struct osd_thandle *oh);
 void osd_trans_note_dirty(struct thandle *th, struct inode *inode);
 void osd_trans_drop_dirty(struct osd_thandle *oh);
 bool osd_trans_writeback_dirty(const struct lu_env *env,

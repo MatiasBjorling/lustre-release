@@ -137,6 +137,26 @@ static int osd_lu_object_init(const struct lu_env *env, struct lu_object *l,
 	obj->oo_dentry = dentry;
 	obj->oo_inode = igrab(d_inode(dentry));
 
+	/* Recovery may change size: complete it before exposing record reads. */
+	if (osd_rec_logged(obj)) {
+		rc = osd_rec_recover(obj);
+		if (rc)
+			RETURN(rc);
+	}
+	if (osd_rec_small(obj)) {
+		rc = osd_rec_small_load(env, obj);
+		if (rc == -ENOENT) {
+			/* A crash leftover, now removed: the object is absent. */
+			dput(obj->oo_dentry);
+			obj->oo_dentry = NULL;
+			iput(obj->oo_inode);
+			obj->oo_inode = NULL;
+			RETURN(0);
+		}
+		if (rc)
+			RETURN(rc);
+	}
+
 	osd_object_init0(obj);
 
 	RETURN(0);
@@ -206,6 +226,7 @@ struct lu_object *osd_object_alloc(const struct lu_env *env,
 	init_rwsem(&mo->oo_dt.dd_sem);
 	init_rwsem(&mo->oo_guard);
 	init_rwsem(&mo->oo_ext_guard);
+	mutex_init(&mo->oo_rec_lock);
 
 	return l;
 }
@@ -275,6 +296,16 @@ static int osd_attr_get(const struct lu_env *env, struct dt_object *dt,
 	down_read(&obj->oo_guard);
 	osd_inode_getattr(env, obj->oo_inode, obj->oo_dentry, attr);
 	up_read(&obj->oo_guard);
+	/*
+	 * A small record's body is its attribute, not file data. Callers
+	 * branch on the size (ofd_seq_load() treats 0 as "never written"),
+	 * so report the current record length.
+	 */
+	if (osd_rec_small(obj)) {
+		mutex_lock(&obj->oo_rec_lock);
+		attr->la_size = obj->oo_rec_len;
+		mutex_unlock(&obj->oo_rec_lock);
+	}
 
 	return 0;
 }
@@ -378,6 +409,11 @@ static int osd_attr_set(const struct lu_env *env, struct dt_object *dt,
 		return -ENOENT;
 
 	osd_exec_op(env, handle, OSD_OT_ATTR_SET, 0, 0);
+	if ((attr->la_valid & LA_SIZE) && osd_rec_logged(obj)) {
+		rc = osd_rec_resize(obj, attr->la_size);
+		if (rc)
+			return rc;
+	}
 
 	rc = osd_attr_to_xfs(attr, &xa);
 	if (rc)
@@ -663,6 +699,12 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 
 	obj->oo_dentry = dentry;
 	obj->oo_inode = igrab(d_inode(dentry));
+	if (osd_rec_small(obj)) {
+		/* No value yet: reads see empty until the first write. */
+		obj->oo_rec_cached = true;
+		obj->oo_rec_len = 0;
+	}
+
 
 	osd_object_init0(obj);
 

@@ -238,6 +238,18 @@ static inline bool target_supports_large_nid(struct mgs_target_info *mti)
 #define OBD_INCOMPAT_MULTI_OI   0x00000200
 /** multiple RPCs in flight */
 #define OBD_INCOMPAT_MULTI_RPCS	0x00000400
+/** last_rcvd is authoritative in versioned osd-xfs record attributes */
+#define OBD_INCOMPAT_XFS_REC	0x00000800
+
+#define OSD_REC_FORMAT_XATTR	"trusted.osdrec.format"
+#define OSD_REC_FORMAT_VERSION	1
+#define OSD_REC_FORMAT_MIGRATING	1
+#define OSD_REC_FORMAT_READY	2
+
+struct osd_rec_format {
+	__le32 version;
+	__le32 state;
+};
 
 /* last_rcvd handling */
 static inline void lsd_le_to_cpu(struct lr_server_data *buf,

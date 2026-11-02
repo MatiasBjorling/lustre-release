@@ -41,6 +41,613 @@ static struct file *osd_object_open(struct osd_object *obj, int flags)
 			   flags | O_LARGEFILE, current_cred());
 }
 
+/* ------------------------------------------------------------------ */
+/* small record I/O: last_rcvd, LAST_ID, llog records                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * LAST_ID: the per-sequence object id watermark, eight bytes rewritten in
+ * place. As file data it was written back at the commit barrier, outside the
+ * XFS log and so unordered against the creates it describes. It is kept in
+ * one attribute instead, logged when the transaction that wrote it stops,
+ * after that transaction's creates. Readers see the current value at once
+ * from oo_rec_val; only the durable copy waits.
+ *
+ * A LAST_ID left by a crash between its create and its first value has no
+ * attribute and size zero. Nothing can depend on a value that was never
+ * logged, so it is removed at lookup and the caller creates it again, rather
+ * than failing the mount reading eight bytes from an empty file.
+ */
+#define OSD_REC_SMALL_XATTR	"trusted.osdrec.value"
+
+bool osd_rec_small(const struct osd_object *obj)
+{
+	return fid_is_last_id(lu_object_fid(&obj->oo_dt.do_lu));
+}
+
+/* Called once at lookup. Returns -ENOENT for a crash leftover it removed. */
+int osd_rec_small_load(const struct lu_env *env, struct osd_object *obj)
+{
+	struct osd_device *osd = osd_obj2dev(obj);
+	struct inode *inode = obj->oo_inode;
+	loff_t size = i_size_read(inode);
+	int rc;
+
+	rc = __vfs_getxattr(obj->oo_dentry, inode, OSD_REC_SMALL_XATTR,
+			    obj->oo_rec_val, sizeof(obj->oo_rec_val));
+	if (rc >= 0) {
+		obj->oo_rec_len = rc;
+		obj->oo_rec_cached = true;
+		return 0;
+	}
+	if (rc == -ERANGE)
+		return -EUCLEAN;
+	if (rc != -ENODATA)
+		return rc;
+
+	/* Written as file data by an earlier osd-xfs; adopted as is. */
+	if (size > 0) {
+		struct file *file = osd_object_open(obj, O_RDONLY);
+		loff_t pos = 0;
+
+		if (size > sizeof(obj->oo_rec_val))
+			return -EUCLEAN;
+		if (IS_ERR(file))
+			return PTR_ERR(file);
+		rc = kernel_read(file, obj->oo_rec_val, size, &pos);
+		fput(file);
+		if (rc != size)
+			return rc < 0 ? rc : -EIO;
+		obj->oo_rec_len = size;
+		obj->oo_rec_cached = true;
+		return 0;
+	}
+
+	CWARN("%s: removing "DFID", created without a value before a crash\n",
+	      osd_name(osd), PFID(lu_object_fid(&obj->oo_dt.do_lu)));
+	rc = osd_obj_map_delete(env, osd, lu_object_fid(&obj->oo_dt.do_lu));
+	return rc ? rc : -ENOENT;
+}
+
+static int osd_rec_small_log(struct osd_object *obj)
+{
+	int rc;
+
+	lockdep_assert_held(&obj->oo_rec_lock);
+	if (!obj->oo_rec_dirty)
+		return 0;
+	inode_lock(obj->oo_inode);
+	rc = __vfs_setxattr(&nop_mnt_idmap, obj->oo_dentry, obj->oo_inode,
+			    OSD_REC_SMALL_XATTR, obj->oo_rec_val,
+			    obj->oo_rec_len, 0);
+	inode_unlock(obj->oo_inode);
+	if (rc == 0)
+		obj->oo_rec_dirty = false;
+	return rc;
+}
+
+static ssize_t osd_rec_small_read(struct osd_object *obj, struct lu_buf *buf,
+				  loff_t *pos)
+{
+	ssize_t rc = 0;
+
+	mutex_lock(&obj->oo_rec_lock);
+	if (*pos < 0)
+		rc = -EINVAL;
+	else if (*pos < obj->oo_rec_len) {
+		rc = min_t(loff_t, buf->lb_len, obj->oo_rec_len - *pos);
+		memcpy(buf->lb_buf, obj->oo_rec_val + *pos, rc);
+		*pos += rc;
+	}
+	mutex_unlock(&obj->oo_rec_lock);
+	return rc;
+}
+
+static ssize_t osd_rec_small_write(const struct lu_env *env,
+				   struct osd_object *obj,
+				   const struct lu_buf *buf, loff_t *pos,
+				   struct thandle *handle)
+{
+	struct osd_thandle *oh = handle ? osd_thandle(handle) : NULL;
+	ssize_t rc = buf->lb_len;
+	int i;
+
+	if (*pos < 0 || buf->lb_len > OSD_REC_SMALL_MAX ||
+	    *pos > OSD_REC_SMALL_MAX - buf->lb_len)
+		return -EFBIG;
+
+	mutex_lock(&obj->oo_rec_lock);
+	if (*pos > obj->oo_rec_len)
+		memset(obj->oo_rec_val + obj->oo_rec_len, 0,
+		       *pos - obj->oo_rec_len);
+	memcpy(obj->oo_rec_val + *pos, buf->lb_buf, buf->lb_len);
+	obj->oo_rec_len = max_t(loff_t, obj->oo_rec_len, *pos + buf->lb_len);
+	obj->oo_rec_cached = true;
+	obj->oo_rec_dirty = true;
+	*pos += buf->lb_len;
+
+	if (oh == NULL) {
+		/* Nothing to defer it to: durable before returning. */
+		int err = osd_rec_small_log(obj);
+
+		mutex_unlock(&obj->oo_rec_lock);
+		if (err)
+			return osd_commit_error(osd_obj2dev(obj), err);
+		return osd_force_log(osd_obj2dev(obj)) ?: rc;
+	}
+	mutex_unlock(&obj->oo_rec_lock);
+
+	for (i = 0; i < oh->ot_ndefer; i++)
+		if (oh->ot_defer[i] == obj)
+			return rc;
+	if (oh->ot_ndefer == OSD_TH_MAX_DEFER)
+		return -E2BIG;
+	lu_object_get(&obj->oo_dt.do_lu);
+	oh->ot_defer[oh->ot_ndefer++] = obj;
+	return rc;
+}
+
+/*
+ * Log the small records this transaction wrote, after all of its effects.
+ * Runs at trans_stop on every exit, so the references are always dropped.
+ */
+int osd_rec_defer_flush(const struct lu_env *env, struct osd_thandle *oh)
+{
+	int i, rc = 0;
+
+	for (i = 0; i < oh->ot_ndefer; i++) {
+		struct osd_object *obj = oh->ot_defer[i];
+		int err;
+
+		mutex_lock(&obj->oo_rec_lock);
+		err = osd_rec_small_log(obj);
+		mutex_unlock(&obj->oo_rec_lock);
+		if (err && rc == 0)
+			rc = err;
+		dt_object_put(env, &obj->oo_dt);
+		oh->ot_defer[i] = NULL;
+	}
+	oh->ot_ndefer = 0;
+	return rc;
+}
+/*
+ * last_rcvd is rewritten once per write RPC, always at the same offset. As
+ * regular file data that is a 4 KiB page the commit path has to write back,
+ * which on a rotating device is a seek out of the sequential data stream and
+ * back: measured at a fifth of every request reaching the drive under a
+ * streaming write.
+ *
+ * osd-ldiskfs does not pay that. It sets LDISKFS_INODE_JOURNAL_DATA and
+ * writes the block through the journal, so the record is metadata and rides
+ * the journal's own sequential stream. XFS has no data journalling, and
+ * exports no symbols, so the only route from here to logged XFS metadata is
+ * the attribute fork through __vfs_setxattr, which osd-xfs already uses.
+ *
+ * A local (in-line) attribute value is logged: a same-size shortform replace
+ * is XFS_ILOG_ADATA inode-fork data, and a leaf-format update logs the
+ * name/value range with xfs_trans_log_buf. Both are recovered from the log
+ * with no block writeback, which is the ldiskfs property being matched. A
+ * value must stay below xfs_attr_leaf_entsize_local_max(), 3 KiB at a 4 KiB
+ * block size, or it goes remote and its blocks are written by a raw
+ * xfs_bwrite that is never logged. Records are therefore stored in chunks.
+ *
+ * The file keeps its size and its data blocks: i_size is what
+ * tgt_server_data_init() branches on and what bounds client-slot
+ * enumeration, so it is still extended, and the file data is still written
+ * so that lr_reader and a direct mount see plausible content. The data is a
+ * mirror; the xattrs are authoritative on read.
+ */
+#define OSD_REC_CHUNK		512
+#define OSD_REC_PREFIX		"trusted.osdrec."
+#define OSD_REC_TRUNCATE "trusted.osdrec.truncate"
+
+struct osd_rec_truncate {
+	__le64 size;
+	__le64 previous_size;
+};
+
+bool osd_rec_logged(const struct osd_object *obj)
+{
+	const struct lu_fid *fid = lu_object_fid(&obj->oo_dt.do_lu);
+
+	return fid_seq(fid) == FID_SEQ_LOCAL_FILE &&
+	       fid_oid(fid) == LAST_RECV_OID;
+}
+
+static void osd_rec_name(char *buf, size_t len, loff_t chunk)
+{
+	snprintf(buf, len, OSD_REC_PREFIX "%llu", (unsigned long long)chunk);
+}
+
+/*
+ * Read or write one record through the attribute fork, one chunk at a time.
+ *
+ * Missing chunks may be seeded from file data only during legacy migration.
+ * Once ready, every chunk below EOF is authoritative: missing or short values
+ * are corruption, never an invitation to resurrect stale mirror bytes.
+ */
+static ssize_t osd_rec_xattr(struct osd_object *obj, struct file *file,
+			     void *buf, size_t len, loff_t pos, bool write)
+{
+	struct inode *inode = obj->oo_inode;
+	struct dentry *dentry = obj->oo_dentry;
+	void *chunk;
+	size_t done = 0;
+	int rc = 0;
+
+	if (inode == NULL)
+		return -ENOENT;
+
+	OBD_ALLOC(chunk, OSD_REC_CHUNK);
+	if (chunk == NULL)
+		return -ENOMEM;
+
+	lockdep_assert_held(&obj->oo_rec_lock);
+
+	while (done < len) {
+		loff_t at = pos + done;
+		loff_t base = round_down(at, OSD_REC_CHUNK);
+		size_t off = at - base;
+		size_t bytes = min_t(size_t, len - done, OSD_REC_CHUNK - off);
+		char name[sizeof(OSD_REC_PREFIX) + 24];
+		int got;
+
+		osd_rec_name(name, sizeof(name), base / OSD_REC_CHUNK);
+
+		got = __vfs_getxattr(dentry, inode, name, chunk,
+				     OSD_REC_CHUNK);
+		if (got == -ENODATA) {
+			loff_t at_base = base;
+			ssize_t n;
+
+			if (obj->oo_rec_ready && base < i_size_read(inode)) {
+				rc = -EUCLEAN;
+				break;
+			}
+			n = kernel_read(file, chunk, OSD_REC_CHUNK, &at_base);
+			if (n < 0) {
+				rc = n;
+				break;
+			}
+			if (n != min_t(loff_t, OSD_REC_CHUNK,
+					max_t(loff_t, 0, i_size_read(inode) - base))) {
+				rc = -EUCLEAN;
+				break;
+			}
+			if (n < OSD_REC_CHUNK)
+				memset(chunk + n, 0, OSD_REC_CHUNK - n);
+		} else if (got < 0) {
+			rc = got == -ERANGE ? -EUCLEAN : got;
+			break;
+		} else if (got != OSD_REC_CHUNK) {
+			rc = -EUCLEAN;
+			break;
+		}
+
+		if (write) {
+			memcpy(chunk + off, buf + done, bytes);
+			inode_lock(inode);
+			rc = __vfs_setxattr(&nop_mnt_idmap, dentry, inode,
+					    name, chunk, OSD_REC_CHUNK, 0);
+			inode_unlock(inode);
+			if (rc != 0)
+				break;
+		} else {
+			memcpy(buf + done, chunk + off, bytes);
+		}
+
+		done += bytes;
+	}
+
+	OBD_FREE(chunk, OSD_REC_CHUNK);
+
+	return rc != 0 ? rc : done;
+}
+
+/* Caller holds oo_rec_lock. A durable marker makes interrupted shrink replayable. */
+static int osd_rec_finish_truncate(struct osd_object *obj, struct file *file)
+{
+	struct osd_rec_truncate marker;
+	struct inode *inode = obj->oo_inode;
+	struct iattr attr = { .ia_valid = ATTR_SIZE | ATTR_FORCE };
+	u64 size, previous, base;
+	char chunk[OSD_REC_CHUNK];
+	int rc;
+
+	lockdep_assert_held(&obj->oo_rec_lock);
+	rc = __vfs_getxattr(obj->oo_dentry, inode, OSD_REC_TRUNCATE,
+			  &marker, sizeof(marker));
+	if (rc == -ENODATA)
+		return 0;
+	if (rc < 0)
+		return rc;
+	if (rc != sizeof(marker))
+		return -EUCLEAN;
+	size = le64_to_cpu(marker.size);
+	previous = le64_to_cpu(marker.previous_size);
+	if (size > previous || previous > MAX_LFS_FILESIZE)
+		return -EUCLEAN;
+	if (size < LR_SERVER_SIZE)
+		return -EUCLEAN;
+	for (base = round_down(size, OSD_REC_CHUNK); base < previous;
+	     base += OSD_REC_CHUNK) {
+		char name[sizeof(OSD_REC_PREFIX) + 24];
+		size_t keep = base < size ? size - base : 0;
+
+		memset(chunk, 0, sizeof(chunk));
+		if (keep) {
+			rc = osd_rec_xattr(obj, file, chunk, keep, base, false);
+			if (rc < 0)
+				return rc;
+		}
+		osd_rec_name(name, sizeof(name), base / OSD_REC_CHUNK);
+		inode_lock(inode);
+		rc = __vfs_setxattr(&nop_mnt_idmap, obj->oo_dentry, inode,
+				    name, chunk, sizeof(chunk), 0);
+		inode_unlock(inode);
+		if (rc)
+			return rc;
+	}
+	/* Persist zeroed tails before file size can conceal their former extent. */
+	rc = vfs_fsync(file, 0);
+	if (rc)
+		return rc;
+	attr.ia_size = size;
+	inode_lock(inode);
+	rc = notify_change(&nop_mnt_idmap, obj->oo_dentry, &attr, NULL);
+	inode_unlock(inode);
+	if (!rc)
+		rc = vfs_fsync(file, 0);
+	if (rc)
+		return rc;
+	inode_lock(inode);
+	rc = __vfs_removexattr(&nop_mnt_idmap, obj->oo_dentry,
+			      OSD_REC_TRUNCATE);
+	inode_unlock(inode);
+	return rc ? rc : vfs_fsync(file, 0);
+}
+
+static int osd_rec_format_set(struct osd_object *obj, struct file *file,
+			      u32 state)
+{
+	struct osd_rec_format format = {
+		.version = cpu_to_le32(OSD_REC_FORMAT_VERSION),
+		.state = cpu_to_le32(state),
+	};
+	int rc;
+
+	inode_lock(obj->oo_inode);
+	rc = __vfs_setxattr(&nop_mnt_idmap, obj->oo_dentry, obj->oo_inode,
+			    OSD_REC_FORMAT_XATTR, &format, sizeof(format), 0);
+	inode_unlock(obj->oo_inode);
+	return rc ? rc : vfs_fsync(file, 0);
+}
+
+/* No target reads are exposed until this migration/replay has completed. */
+static int osd_rec_prepare(struct osd_object *obj, struct file *file,
+			   bool readonly)
+{
+	struct osd_rec_format format;
+	struct lr_server_data header;
+	char *chunk = (char *)&header;
+	struct inode *inode = obj->oo_inode;
+	loff_t size, base, pos;
+	bool ready = false, marked;
+	int rc;
+
+	lockdep_assert_held(&obj->oo_rec_lock);
+	BUILD_BUG_ON(sizeof(header) != OSD_REC_CHUNK);
+	rc = __vfs_getxattr(obj->oo_dentry, inode, OSD_REC_FORMAT_XATTR,
+			  &format, sizeof(format));
+	marked = rc != -ENODATA;
+	if (rc != -ENODATA) {
+		if (rc < 0)
+			return rc == -ERANGE ? -EUCLEAN : rc;
+		if (rc != sizeof(format))
+			return -EUCLEAN;
+		if (le32_to_cpu(format.version) != OSD_REC_FORMAT_VERSION)
+			return -EOPNOTSUPP;
+		if (le32_to_cpu(format.state) != OSD_REC_FORMAT_MIGRATING &&
+		    le32_to_cpu(format.state) != OSD_REC_FORMAT_READY)
+			return -EUCLEAN;
+		ready = le32_to_cpu(format.state) == OSD_REC_FORMAT_READY;
+	}
+	/* A read-only opener must not replay either sort of repair marker. */
+	if (readonly) {
+		rc = __vfs_getxattr(obj->oo_dentry, inode, OSD_REC_TRUNCATE,
+				  NULL, 0);
+		if (rc != -ENODATA)
+			return rc < 0 ? rc : -EROFS;
+		if (!ready && (marked || i_size_read(inode)))
+			return -EROFS;
+	}
+	obj->oo_rec_ready = ready;
+	size = i_size_read(inode);
+	/* New objects acquire their format with their first complete header. */
+	if (!size)
+		return ready ? -EUCLEAN : 0;
+	if (size < sizeof(header))
+		return -EUCLEAN;
+	rc = osd_rec_xattr(obj, file, &header, sizeof(header), 0, false);
+	if (rc < 0)
+		return rc;
+	if (!marked && (le32_to_cpu(header.lsd_feature_incompat) &
+			OBD_INCOMPAT_XFS_REC))
+		return -EUCLEAN;
+	if (ready && !(le32_to_cpu(header.lsd_feature_incompat) &
+		       OBD_INCOMPAT_XFS_REC))
+		return -EUCLEAN;
+	if (!ready) {
+		__le32 incompat;
+
+		rc = osd_rec_format_set(obj, file, OSD_REC_FORMAT_MIGRATING);
+		if (rc)
+			return rc;
+		/* Fence the file reader before creating even attribute zero. A
+		 * crash before this fence must not leave a newly seeded attribute
+		 * shadowing later writes by an older file-only implementation.
+		 * Preserve each legacy header's own bytes: an existing attr zero
+		 * may already be authoritative and newer than the file header.
+		 */
+		pos = offsetof(struct lr_server_data, lsd_feature_incompat);
+		rc = kernel_read(file, &incompat, sizeof(incompat), &pos);
+		if (rc != sizeof(incompat))
+			return rc < 0 ? rc : -EUCLEAN;
+		incompat |= cpu_to_le32(OBD_INCOMPAT_XFS_REC);
+		pos = offsetof(struct lr_server_data, lsd_feature_incompat);
+		rc = kernel_write(file, &incompat, sizeof(incompat), &pos);
+		if (rc != sizeof(incompat))
+			return rc < 0 ? rc : -EIO;
+		rc = vfs_fsync(file, 0);
+		if (rc)
+			return rc;
+		/* Old osd-xfs reads attribute zero instead: fence it separately,
+		 * retaining the previously authoritative header, then persist.
+		 * Every MIGRATING resume repeats both fences before any seeding.
+		 */
+		header.lsd_feature_incompat |= cpu_to_le32(OBD_INCOMPAT_XFS_REC);
+		rc = osd_rec_xattr(obj, file, &header, sizeof(header), 0, true);
+		if (rc < 0)
+			return rc;
+		rc = vfs_fsync(file, 0);
+		if (rc)
+			return rc;
+	}
+	/* Truncate replay also writes authoritative chunks; it must not run
+	 * until both downgrade readers have been fenced durably.
+	 */
+	if (!readonly) {
+		rc = osd_rec_finish_truncate(obj, file);
+		if (rc)
+			return rc;
+		size = i_size_read(inode);
+	}
+	/* Preserve old authoritative attributes, including those whose mirror
+	 * never reached disk. Seed only absent chunks, with a zero-padded EOF.
+	 * Repeating any prefix after a crash preserves exactly the same bytes.
+	 */
+	for (base = 0; base < size; base += OSD_REC_CHUNK) {
+		size_t bytes = min_t(loff_t, OSD_REC_CHUNK, size - base);
+
+		rc = osd_rec_xattr(obj, file, chunk, bytes, base, false);
+		if (rc < 0)
+			return rc;
+		if (!ready) {
+			memset(chunk + bytes, 0, OSD_REC_CHUNK - bytes);
+			rc = osd_rec_xattr(obj, file, chunk, OSD_REC_CHUNK, base,
+					   true);
+			if (rc < 0)
+				return rc;
+		}
+	}
+	if (!ready) {
+		rc = vfs_fsync(file, 0);
+		if (rc)
+			return rc;
+		rc = osd_rec_format_set(obj, file, OSD_REC_FORMAT_READY);
+		if (rc)
+			return rc;
+	} else {
+		pos = 0;
+		rc = kernel_read(file, &header, sizeof(header), &pos);
+		if (rc != sizeof(header))
+			return rc < 0 ? rc : -EUCLEAN;
+		if (!(le32_to_cpu(header.lsd_feature_incompat) &
+		      OBD_INCOMPAT_XFS_REC))
+			return -EUCLEAN;
+	}
+	obj->oo_rec_ready = true;
+	return 0;
+}
+
+/* Materialize zero-filled holes before making their size visible. */
+static int osd_rec_extend(struct osd_object *obj, struct file *file, u64 size)
+{
+	char zero[OSD_REC_CHUNK] = {};
+	u64 pos = i_size_read(obj->oo_inode);
+	int rc;
+
+	while (pos < size) {
+		size_t bytes = min_t(u64, size - pos,
+				     OSD_REC_CHUNK - pos % OSD_REC_CHUNK);
+
+		rc = osd_rec_xattr(obj, file, zero, bytes, pos, true);
+		if (rc < 0)
+			return rc;
+		pos += bytes;
+	}
+	return 0;
+}
+
+int osd_rec_resize(struct osd_object *obj, u64 size)
+{
+	struct file *file;
+	struct inode *inode = obj->oo_inode;
+	struct iattr attr = { .ia_valid = ATTR_SIZE | ATTR_FORCE };
+	int rc;
+
+	if (size > MAX_LFS_FILESIZE)
+		return -EFBIG;
+	if (size < LR_SERVER_SIZE)
+		return -EINVAL;
+	file = osd_object_open(obj, O_RDWR);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	mutex_lock(&obj->oo_rec_lock);
+	rc = osd_rec_finish_truncate(obj, file);
+	if (rc)
+		goto out;
+	if (size < i_size_read(inode)) {
+		struct osd_rec_truncate marker = {
+			.size = cpu_to_le64(size),
+			.previous_size = cpu_to_le64(i_size_read(inode)),
+		};
+
+		inode_lock(inode);
+		rc = __vfs_setxattr(&nop_mnt_idmap, obj->oo_dentry, inode,
+				    OSD_REC_TRUNCATE, &marker, sizeof(marker), 0);
+		inode_unlock(inode);
+		if (!rc)
+			rc = vfs_fsync(file, 0);
+		if (!rc)
+			rc = osd_rec_finish_truncate(obj, file);
+	} else if (size > i_size_read(inode)) {
+		rc = osd_rec_extend(obj, file, size);
+		if (rc)
+			goto out;
+		attr.ia_size = size;
+		inode_lock(inode);
+		rc = notify_change(&nop_mnt_idmap, obj->oo_dentry, &attr, NULL);
+		inode_unlock(inode);
+		if (!rc)
+			rc = vfs_fsync(file, 0);
+	}
+out:
+	mutex_unlock(&obj->oo_rec_lock);
+	fput(file);
+	return rc ? osd_commit_error(osd_obj2dev(obj), rc) : 0;
+}
+
+int osd_rec_recover(struct osd_object *obj)
+{
+	bool readonly = osd_obj2dev(obj)->od_dt_dev.dd_rdonly ||
+			sb_rdonly(obj->oo_inode->i_sb);
+	struct file *file = osd_object_open(obj, readonly ? O_RDONLY : O_RDWR);
+	int rc;
+
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	mutex_lock(&obj->oo_rec_lock);
+	rc = osd_rec_prepare(obj, file, readonly);
+	mutex_unlock(&obj->oo_rec_lock);
+	fput(file);
+	if (rc)
+		CERROR("%s: last_rcvd format initialization failed: rc=%d%s\n",
+		       osd_name(osd_obj2dev(obj)), rc,
+		       rc == -EROFS ? "; writable mount required for record repair" : "");
+	return rc;
+}
+
 static ssize_t osd_read(const struct lu_env *env, struct dt_object *dt,
 			struct lu_buf *buf, loff_t *pos)
 {
@@ -48,11 +655,32 @@ static ssize_t osd_read(const struct lu_env *env, struct dt_object *dt,
 	struct file *file;
 	ssize_t rc;
 
+	if (osd_rec_small(obj))
+		return osd_rec_small_read(obj, buf, pos);
+
 	file = osd_object_open(obj, O_RDONLY);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 
-	rc = kernel_read(file, buf->lb_buf, buf->lb_len, pos);
+	if (osd_rec_logged(obj)) {
+		loff_t size;
+
+		mutex_lock(&obj->oo_rec_lock);
+		size = i_size_read(obj->oo_inode);
+		if (*pos < 0)
+			rc = -EINVAL;
+		else if (*pos >= size)
+			rc = 0;
+		else
+			rc = osd_rec_xattr(obj, file, buf->lb_buf,
+					   min_t(u64, buf->lb_len, size - *pos),
+					   *pos, false);
+		if (rc > 0)
+			*pos += rc;
+		mutex_unlock(&obj->oo_rec_lock);
+	} else {
+		rc = kernel_read(file, buf->lb_buf, buf->lb_len, pos);
+	}
 	fput(file);
 
 	return rc;
@@ -68,6 +696,11 @@ static ssize_t osd_declare_write(const struct lu_env *env,
 	u64 blocks = DIV_ROUND_UP_ULL(buf->lb_len, blocksize) + 1;
 
 	/* pos may be -1 and lb_buf NULL during reply-data declaration. */
+	if (osd_rec_small(obj))
+		blocks = OSD_DECL_BLK_XATTR_SET;
+	else if (osd_rec_logged(obj))
+		blocks += (DIV_ROUND_UP_ULL(buf->lb_len, OSD_REC_CHUNK) + 1) *
+			  OSD_DECL_BLK_XATTR_SET;
 	osd_declare_op(handle, OSD_OT_WRITE, blocks, 0);
 	return 0;
 }
@@ -85,6 +718,8 @@ static ssize_t osd_write(const struct lu_env *env, struct dt_object *dt,
 			return rc;
 		osd_exec_op(env, handle, OSD_OT_WRITE, 0, 0);
 	}
+	if (osd_rec_small(obj))
+		return osd_rec_small_write(env, obj, buf, pos, handle);
 
 	/*
 	 * Not O_DSYNC when a transaction is carrying the write. Every write
@@ -98,12 +733,108 @@ static ssize_t osd_write(const struct lu_env *env, struct dt_object *dt,
 	 * Without a transaction there is nothing to carry the sync, so the
 	 * write has to be durable when it returns.
 	 */
-	file = osd_object_open(obj, O_WRONLY | (handle != NULL ? 0 : O_DSYNC));
+	/*
+	 * O_RDWR for a logged record: seeding a chunk that has no logged
+	 * copy yet reads the file-data mirror first.
+	 */
+	file = osd_object_open(obj, (osd_rec_logged(obj) ? O_RDWR : O_WRONLY) |
+				    (handle != NULL ? 0 : O_DSYNC));
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 
-	osd_trans_note_dirty(handle, obj->oo_inode);
-	rc = kernel_write(file, buf->lb_buf, buf->lb_len, pos);
+	/*
+	 * The record goes to the attribute fork, where XFS logs it, and then
+	 * to file data. The file data keeps i_size right, which is what
+	 * tgt_server_data_init() branches on and what bounds client-slot
+	 * enumeration, and keeps a direct mount or lr_reader able to see the
+	 * record. It is only a mirror: the read path above prefers the
+	 * logged copy.
+	 *
+	 * Once the format is READY, the mirror is never used to recover missing
+	 * attributes. Its header permanently retains the incompatibility fence;
+	 * slot enumeration continues to use the durable file size.
+	 */
+	if (osd_rec_logged(obj)) {
+		loff_t start = *pos;
+		loff_t old_size;
+		const __le32 fence = cpu_to_le32(OBD_INCOMPAT_XFS_REC);
+		const size_t fence_at = offsetof(struct lr_server_data,
+					       lsd_feature_incompat);
+		size_t i;
+
+		mutex_lock(&obj->oo_rec_lock);
+		rc = osd_rec_finish_truncate(obj, file);
+		if (rc)
+			goto out_record_error;
+		old_size = i_size_read(obj->oo_inode);
+		if (start < 0 || buf->lb_len > MAX_LFS_FILESIZE - start) {
+			rc = -EFBIG;
+			goto out_record;
+		}
+		if (!obj->oo_rec_ready) {
+			/* A newly created object has no header to migrate yet. */
+			if (old_size || start || buf->lb_len != LR_SERVER_SIZE) {
+				rc = -EINVAL;
+				goto out_record;
+			}
+		}
+		/* Never allow a record writer to remove the downgrade fence. */
+		for (i = 0; i < sizeof(fence); i++) {
+			u8 mask = ((const u8 *)&fence)[i];
+
+			if (mask && start <= fence_at + i &&
+			    start + buf->lb_len > fence_at + i &&
+			    (((u8 *)buf->lb_buf)[fence_at + i - start] & mask) != mask) {
+				rc = -EINVAL;
+				goto out_record;
+			}
+		}
+		if (!obj->oo_rec_ready) {
+			rc = osd_rec_format_set(obj, file, OSD_REC_FORMAT_MIGRATING);
+			if (rc)
+				goto out_record_error;
+			rc = kernel_write(file, buf->lb_buf, buf->lb_len, pos);
+			if (rc >= 0 && rc != buf->lb_len)
+				rc = -EIO;
+			if (rc >= 0) {
+				int err = osd_rec_prepare(obj, file, false);
+
+				if (err)
+					rc = err;
+			}
+			goto out_record_error;
+		}
+		if (start > old_size) {
+			rc = osd_rec_extend(obj, file, start);
+			if (rc)
+				goto out_record_error;
+		}
+		rc = osd_rec_xattr(obj, file, buf->lb_buf, buf->lb_len,
+				   start, true);
+		if (rc < 0)
+			goto out_record_error;
+		rc = kernel_write(file, buf->lb_buf, buf->lb_len, pos);
+		if (rc >= 0 && rc != buf->lb_len)
+			rc = -EIO;
+		/* Recovery enumerates slots by durable file size, not xattr keys. */
+		if (rc >= 0 && (start + buf->lb_len > old_size || !handle)) {
+			int err = vfs_fsync(file, 1);
+
+			if (err)
+				rc = err;
+		}
+out_record_error:
+		mutex_unlock(&obj->oo_rec_lock);
+		if (rc < 0)
+			osd_commit_error(osd_obj2dev(obj), rc);
+		fput(file);
+		return rc;
+out_record:
+		mutex_unlock(&obj->oo_rec_lock);
+	} else {
+		osd_trans_note_dirty(handle, obj->oo_inode);
+		rc = kernel_write(file, buf->lb_buf, buf->lb_len, pos);
+	}
 	fput(file);
 
 	return rc;
@@ -520,6 +1251,10 @@ static int osd_punch(const struct lu_env *env, struct dt_object *dt,
 		RETURN(-EOPNOTSUPP);
 	}
 	osd_exec_op(env, th, OSD_OT_PUNCH, 0, 0);
+	if (osd_rec_small(obj))
+		RETURN(start == 0 ? 0 : -EOPNOTSUPP);
+	if (osd_rec_logged(obj))
+		RETURN(osd_rec_resize(obj, start));
 
 	/*
 	 * do_truncate() is not exported to modules and vfs_truncate() would

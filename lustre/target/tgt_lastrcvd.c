@@ -1843,6 +1843,8 @@ int tgt_server_data_init(const struct lu_env *env, struct lu_target *tgt)
 	struct lr_server_data		*lsd = &tgt->lut_lsd;
 	unsigned long			 last_rcvd_size;
 	__u32				 index;
+	__u32				 supported;
+	bool				 xfs_records;
 	int				 rc, type;
 
 	rc = dt_attr_get(env, tgt->lut_last_rcvd, &tti->tti_attr);
@@ -1867,6 +1869,11 @@ int tgt_server_data_init(const struct lu_env *env, struct lu_target *tgt)
 		CERROR("%s: unknown target type %x\n", tgt_name(tgt), type);
 		RETURN(-EINVAL);
 	}
+	xfs_records = !strcmp(tgt->lut_bottom->dd_lu_dev.ld_type->ldt_name,
+			      "osd-xfs");
+	supported = tgt_scd[type].incompat;
+	if (xfs_records)
+		supported |= OBD_INCOMPAT_XFS_REC;
 
 	/* last_rcvd on OST doesn't provide reconstruct support because there
 	 * may be up to 8 in-flight write requests per single slot in
@@ -1889,6 +1896,8 @@ int tgt_server_data_init(const struct lu_env *env, struct lu_target *tgt)
 		lsd->lsd_max_clients = 0;
 		lsd->lsd_feature_rocompat = tgt_scd[type].rocinit;
 		lsd->lsd_feature_incompat = tgt_scd[type].incinit;
+		if (xfs_records)
+			lsd->lsd_feature_incompat |= OBD_INCOMPAT_XFS_REC;
 	} else {
 		rc = tgt_server_data_read(env, tgt);
 		if (rc) {
@@ -1921,10 +1930,10 @@ int tgt_server_data_init(const struct lu_env *env, struct lu_target *tgt)
 		}
 	}
 
-	if (lsd->lsd_feature_incompat & ~tgt_scd[type].incompat) {
+	if (lsd->lsd_feature_incompat & ~supported) {
 		CERROR("%s: unsupported incompat filesystem feature(s) %x\n",
 		       tgt_name(tgt),
-		       lsd->lsd_feature_incompat & ~tgt_scd[type].incompat);
+		       lsd->lsd_feature_incompat & ~supported);
 		RETURN(-EINVAL);
 	}
 

@@ -411,7 +411,7 @@ static int osd_trans_start(const struct lu_env *env, struct dt_device *d,
  * xfs_fs_sync_fs() -> xfs_log_force(mp, XFS_LOG_SYNC), which is exactly the
  * "commit the journal" primitive wanted here.
  */
-static int osd_force_log(struct osd_device *osd)
+int osd_force_log(struct osd_device *osd)
 {
 	struct super_block *sb = osd_sb(osd);
 	int rc;
@@ -489,6 +489,16 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 		th->th_result = oh->ot_res_error;
 	for (i = 0; i < OSD_OT_MAX; i++)
 		mutated |= oh->ot_exec_ops[i] != 0;
+
+	/*
+	 * Log the small records (LAST_ID) after every effect of this
+	 * transaction and before its last_rcvd record. XFS recovers a prefix
+	 * of committed transactions, so a crash cannot keep the watermark and
+	 * lose the objects it covers.
+	 */
+	rc = osd_rec_defer_flush(env, oh);
+	if (rc)
+		th->th_result = osd_commit_error(osd, rc);
 
 	mutex_lock(&osd->od_publish_lock);
 	/*
