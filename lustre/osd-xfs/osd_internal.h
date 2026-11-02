@@ -72,6 +72,27 @@
  */
 #define OSD_XFS_SUBDIR_COUNT	32
 
+/*
+ * Declared cost of each operation, in filesystem blocks and new inodes.
+ *
+ * These are deliberate over-estimates. The declare phase exists so a
+ * transaction that has started cannot fail partway through for want of space,
+ * and refusing work that would have fitted is a far better error than
+ * discovering the problem in the middle of a change that cannot be rolled
+ * back. osd-ldiskfs takes the same view with journal credits and says so.
+ *
+ * Inodes are counted separately because this backend builds its indexes out of
+ * symlinks, so inserting a key allocates an inode rather than just filling a
+ * directory block.
+ */
+#define OSD_DECL_BLK_ATTR_SET	0	/* fits in the inode */
+#define OSD_DECL_BLK_XATTR_SET	2	/* may spill to a remote attr block */
+#define OSD_DECL_BLK_CREATE	2	/* dirent, plus a possible btree split */
+#define OSD_DECL_INO_CREATE	1
+#define OSD_DECL_BLK_INSERT	2	/* symlink body, plus the dirent */
+#define OSD_DECL_INO_INSERT	1
+#define OSD_DECL_BLK_PUNCH	1	/* freeing can still split an extent */
+
 /* the object index directory, immediately below the filesystem root */
 #define OSD_OI_DIRNAME		"oi"
 
@@ -190,6 +211,28 @@ struct osd_oi {
 	struct dentry		*oi_stage;	/* oi/stage/ */
 };
 
+/* operation classes, for per-transaction declare accounting */
+enum osd_op_type {
+	OSD_OT_ATTR_SET = 0,
+	OSD_OT_XATTR_SET,
+	OSD_OT_XATTR_DEL,
+	OSD_OT_CREATE,
+	OSD_OT_DESTROY,
+	OSD_OT_REF_ADD,
+	OSD_OT_REF_DEL,
+	OSD_OT_INSERT,
+	OSD_OT_DELETE,
+	OSD_OT_WRITE,
+	OSD_OT_PUNCH,
+	OSD_OT_MAX
+};
+
+/* what a transaction says it will need, and what it actually took */
+struct osd_reservation {
+	__u64	or_blocks;
+	__u32	or_inodes;
+};
+
 struct osd_device {
 	struct dt_device	 od_dt_dev;
 
@@ -206,7 +249,21 @@ struct osd_device {
 	struct mutex		 od_publish_lock;
 	int			 od_durability_error;
 
+	/* Advisory admission accounting, not an XFS allocation reservation. */
+	struct mutex		 od_res_lock;
+	atomic64_t		 od_res_blocks;
+	atomic64_t		 od_res_inodes;
+	atomic64_t		 od_res_denied;		/* refused early */
+	atomic64_t		 od_res_undeclared;	/* ran without a declare */
+	atomic64_t		 od_res_overrun;	/* used more than declared */
+	atomic64_t		 od_dirty_flushed;	/* buffered writes flushed */
+	atomic64_t		 od_dirty_txn;		/* txns needing a flush */
+	atomic64_t		 od_dirty_overflow;	/* tracking array too small */
 	unsigned int		 od_flush_buffered:1;
+	unsigned int		 od_reserve_check:1;	/* consult free space */
+
+	atomic64_t		 od_statfs_calls;
+	unsigned int		 od_declare_check:1;	/* warn on mismatch */
 
 	/* FID -> object mapping: the O/ directory tree, for OST data objects */
 	struct osd_obj_map	*od_ost_map;
@@ -224,8 +281,7 @@ struct osd_device {
  */
 struct osd_thandle {
 	struct thandle		 ot_super;
-	/* why trans_start refused, returned again by trans_stop */
-	int			 ot_start_error;
+	int			 ot_res_error;
 
 	/*
 	 * Inodes this transaction wrote with buffered I/O, so trans_stop can
@@ -238,8 +294,12 @@ struct osd_thandle {
 	int			 ot_ndirty;
 	unsigned int		 ot_dirty_overflow:1;
 
-	/* an execute method ran, so recovery publication is owed */
-	unsigned int		 ot_mutated:1;
+	/* what this transaction declared, and what it has consumed */
+	struct osd_reservation	 ot_res;
+	struct osd_reservation	 ot_used;
+	int			 ot_declare_ops[OSD_OT_MAX];
+	int			 ot_exec_ops[OSD_OT_MAX];
+	unsigned int		 ot_res_claimed:1;
 	struct list_head	 ot_commit_dcb_list;
 	struct list_head	 ot_stop_dcb_list;
 	unsigned int		 ot_started:1;
@@ -310,13 +370,6 @@ static inline struct osd_thandle *osd_thandle(struct thandle *th)
 	return container_of_safe(th, struct osd_thandle, ot_super);
 }
 
-/* Note that @th changed something, so trans_stop must publish it. */
-static inline void osd_trans_mutated(struct thandle *th)
-{
-	if (th != NULL)
-		osd_thandle(th)->ot_mutated = 1;
-}
-
 /* ------------------------------------------------------------------ */
 /* osd_oi.c - the O/<seq>/dN/<oid> object map                          */
 /* ------------------------------------------------------------------ */
@@ -385,12 +438,22 @@ struct dentry *osd_lookup_or_mkdir(struct osd_device *dev,
 				   struct dentry *parent, const char *name,
 				   bool create);
 
+/* declare phase and space reservation; see osd_reserve.c */
+void osd_declare_op(struct thandle *th, enum osd_op_type op, __u64 blocks,
+		    __u32 inodes);
+void osd_exec_op(const struct lu_env *env, struct thandle *th,
+		 enum osd_op_type op, __u64 blocks, __u32 inodes);
+int  osd_reserve_claim(const struct lu_env *env, struct osd_device *osd,
+		       struct osd_thandle *oh);
+void osd_reserve_release(struct osd_device *osd, struct osd_thandle *oh);
+void osd_reserve_init(struct osd_device *osd);
 int osd_commit_error(struct osd_device *osd, int error);
 void osd_trans_note_dirty(struct thandle *th, struct inode *inode);
 void osd_trans_drop_dirty(struct osd_thandle *oh);
 bool osd_trans_writeback_dirty(const struct lu_env *env,
 			       struct osd_device *osd,
 			       struct osd_thandle *oh, int *rcp);
+const char *osd_op_name(enum osd_op_type op);
 
 int  osd_oi_lookup(const struct lu_env *env, struct osd_device *dev,
 		   const struct lu_fid *fid, struct dentry **dentry);

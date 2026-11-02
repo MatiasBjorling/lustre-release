@@ -107,6 +107,42 @@ static int osd_dir_lookup(const struct lu_env *env, struct dt_object *dt,
 	RETURN(rc == 0 ? 1 : rc);
 }
 
+/*
+ * An insert costs an inode here, which it does not in osd-ldiskfs. There an
+ * entry is a few bytes written into a directory block; in this backend every
+ * index is a directory and every entry is a symlink holding the value, so
+ * adding a key allocates an inode as well as growing the parent. A filesystem
+ * out of inodes would otherwise fail the insert in the middle of a
+ * transaction that has already started, which is precisely what the declare
+ * phase exists to prevent.
+ *
+ * Both index flavours are the same shape on disk, so they share this.
+ */
+static int osd_index_declare_insert(const struct lu_env *env,
+				    struct dt_object *dt,
+				    const struct dt_rec *rec,
+				    const struct dt_key *key,
+				    struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_INSERT, OSD_DECL_BLK_INSERT,
+		       OSD_DECL_INO_INSERT);
+	return 0;
+}
+
+/*
+ * A delete only frees space, so it reserves nothing; the declare is still
+ * needed so the operation is accounted for and does not look undeclared when
+ * it runs.
+ */
+static int osd_index_declare_delete(const struct lu_env *env,
+				    struct dt_object *dt,
+				    const struct dt_key *key,
+				    struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_DELETE, 0, 0);
+	return 0;
+}
+
 static int osd_dir_insert(const struct lu_env *env, struct dt_object *dt,
 			  const struct dt_rec *rec, const struct dt_key *key,
 			  struct thandle *th)
@@ -143,7 +179,7 @@ static int osd_dir_insert(const struct lu_env *env, struct dt_object *dt,
 	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 		RETURN(0);
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_INSERT, 0, 0);
 
 	rc = osd_fid_lookup(env, osd, cfid, &child);
 	if (rc != 0) {
@@ -299,7 +335,7 @@ static int osd_dir_delete(const struct lu_env *env, struct dt_object *dt,
 	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 		RETURN(0);
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_DELETE, 0, 0);
 
 	inode_lock(obj->oo_inode);
 	dchild = lookup_noperm(&qstr, obj->oo_dentry);
@@ -666,7 +702,9 @@ static int osd_it_dir_load(const struct lu_env *env, const struct dt_it *di,
 
 const struct dt_index_operations osd_dir_ops = {
 	.dio_lookup		= osd_dir_lookup,
+	.dio_declare_insert	= osd_index_declare_insert,
 	.dio_insert		= osd_dir_insert,
+	.dio_declare_delete	= osd_index_declare_delete,
 	.dio_delete		= osd_dir_delete,
 	.dio_it			= {
 		.init		= osd_it_dir_init,
@@ -838,7 +876,7 @@ static int osd_kv_insert(const struct lu_env *env, struct dt_object *dt,
 	osd_hex_encode(name, key, ks);
 	osd_hex_encode(body, rec, rs);
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_INSERT, 0, 0);
 
 	qstr.name = name;
 	qstr.len = ks * 2;
@@ -891,7 +929,7 @@ static int osd_kv_delete(const struct lu_env *env, struct dt_object *dt,
 	qstr.name = name;
 	qstr.len = ks * 2;
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_DELETE, 0, 0);
 
 	inode_lock(obj->oo_inode);
 	dchild = lookup_noperm(&qstr, obj->oo_dentry);
@@ -1000,7 +1038,9 @@ static int osd_it_kv_load(const struct lu_env *env, const struct dt_it *di,
 
 const struct dt_index_operations osd_kv_ops = {
 	.dio_lookup		= osd_kv_lookup,
+	.dio_declare_insert	= osd_index_declare_insert,
 	.dio_insert		= osd_kv_insert,
+	.dio_declare_delete	= osd_index_declare_delete,
 	.dio_delete		= osd_kv_delete,
 	.dio_it			= {
 		.init		= osd_it_kv_init,

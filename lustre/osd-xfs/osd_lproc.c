@@ -47,6 +47,63 @@ static int osd_fstype_seq_show(struct seq_file *m, void *data)
 LDEBUGFS_SEQ_FOPS_RO(osd_fstype);
 
 /*
+ * The declare phase and its reservation.
+ *
+ * "denied" counts transactions refused at trans_start for want of space, which
+ * is the whole point: each one is a change that would otherwise have failed
+ * partway through. "undeclared" and "overrun" count drift between the declare
+ * and execute phases, and both should stay at zero; a non-zero value is a bug
+ * in this backend, not a condition to tune around.
+ */
+static int osd_reserve_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+
+	seq_printf(m, "blocks_promised: %lld\n",
+		   atomic64_read(&osd->od_res_blocks));
+	seq_printf(m, "inodes_promised: %lld\n",
+		   atomic64_read(&osd->od_res_inodes));
+	seq_printf(m, "denied:          %lld\n",
+		   atomic64_read(&osd->od_res_denied));
+	seq_printf(m, "undeclared:      %lld\n",
+		   atomic64_read(&osd->od_res_undeclared));
+	seq_printf(m, "overrun:         %lld\n",
+		   atomic64_read(&osd->od_res_overrun));
+	seq_printf(m, "declare_check:   %u\n", osd->od_declare_check);
+	seq_printf(m, "dirty_txn:       %lld\n",
+		   atomic64_read(&osd->od_dirty_txn));
+	seq_printf(m, "dirty_flushed:   %lld\n",
+		   atomic64_read(&osd->od_dirty_flushed));
+	seq_printf(m, "flush_buffered:  %u\n", osd->od_flush_buffered);
+	seq_printf(m, "dirty_overflow:  %lld\n",
+		   atomic64_read(&osd->od_dirty_overflow));
+	seq_printf(m, "reserve_check:   %u\n", osd->od_reserve_check);
+	seq_printf(m, "statfs_calls:    %lld\n",
+		   atomic64_read(&osd->od_statfs_calls));
+
+	return 0;
+}
+
+static ssize_t osd_reserve_seq_write(struct file *file,
+				     const char __user *buffer,
+				     size_t count, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	bool val;
+	int rc;
+
+	rc = kstrtobool_from_user(buffer, count, &val);
+	if (rc)
+		return rc;
+	osd->od_declare_check = val;
+
+	return count;
+}
+LDEBUGFS_SEQ_FOPS(osd_reserve);
+
+
+/*
  * Whether trans_stop flushes the buffered writes of the transaction.
  *
  * This is a correctness switch, not a tuning knob. xfs_fs_sync_fs(sb, 1)
@@ -82,6 +139,42 @@ static ssize_t osd_flush_buffered_seq_write(struct file *file,
 	return count;
 }
 LDEBUGFS_SEQ_FOPS(osd_flush_buffered);
+
+/*
+ * Whether the declare phase consults free space at all.
+ *
+ * For attributing cost only. With this off nothing is reserved and a
+ * transaction can once again discover -ENOSPC partway through a change it
+ * cannot roll back, which is the entire problem the declare phase exists to
+ * solve. Not something to leave off.
+ */
+static int osd_reserve_check_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+
+	seq_printf(m, "%u\n", osd->od_reserve_check);
+	return 0;
+}
+
+static ssize_t osd_reserve_check_seq_write(struct file *file,
+					   const char __user *buffer,
+					   size_t count, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	bool val;
+	int rc;
+
+	rc = kstrtobool_from_user(buffer, count, &val);
+	if (rc)
+		return rc;
+	osd->od_reserve_check = val;
+	if (!val)
+		CWARN("%s: space reservation disabled; -ENOSPC can now strike partway through a transaction\n",
+		      osd_name(osd));
+	return count;
+}
+LDEBUGFS_SEQ_FOPS(osd_reserve_check);
 
 static struct attribute *xfs_attrs[] = {
 	NULL,
@@ -161,8 +254,12 @@ static struct ldebugfs_vars ldebugfs_osd_obd_vars[] = {
 	  .fops = &osd_mount_options_fops },
 	{ .name = "fstype",
 	  .fops = &osd_fstype_fops },
+	{ .name = "reserve",
+	  .fops = &osd_reserve_fops },
 	{ .name = "flush_buffered",
 	  .fops = &osd_flush_buffered_fops },
+	{ .name = "reserve_check",
+	  .fops = &osd_reserve_check_fops },
 	{ NULL }
 };
 

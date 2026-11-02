@@ -378,23 +378,28 @@ static int osd_trans_start(const struct lu_env *env, struct dt_device *d,
 	ENTRY;
 	rc = osd_commit_error(osd, 0);
 	if (rc != 0) {
-		oh->ot_start_error = rc;
+		oh->ot_res_error = rc;
 		RETURN(rc);
 	}
 
 	/*
-	 * The target start hook declares recovery-record and version
-	 * updates. The stop hook assigns the recovery transno and writes
-	 * last_rcvd only after execution, under od_publish_lock.
+	 * The target start hook declares recovery-record and version updates
+	 * before advisory admission. The stop hook assigns the recovery transno
+	 * and writes last_rcvd only after execution, under od_publish_lock.
 	 */
 	rc = dt_txn_hook_start(env, d, th);
 	if (rc != 0) {
-		oh->ot_start_error = rc;
+		oh->ot_res_error = rc;
 		RETURN(rc);
 	}
 
-	oh->ot_started = 1;
-	RETURN(0);
+	/* Advisory admission can refuse execution, but cannot reserve XFS space. */
+	rc = osd_reserve_claim(env, osd, oh);
+	if (rc == 0)
+		oh->ot_started = 1;
+	else
+		oh->ot_res_error = rc;
+	RETURN(rc);
 }
 
 /*
@@ -469,144 +474,28 @@ static int osd_trans_complete(const struct lu_env *env, struct osd_device *osd,
 	return error;
 }
 
-/*
- * Note an inode this transaction wrote with buffered I/O.
- *
- * Duplicates are dropped: a transaction typically writes last_rcvd several
- * times and there is no point flushing it more than once.
- */
-void osd_trans_note_dirty(struct thandle *th, struct inode *inode)
-{
-	struct osd_thandle *oh;
-	int i;
-
-	if (th == NULL || inode == NULL)
-		return;
-
-	oh = osd_thandle(th);
-
-	for (i = 0; i < oh->ot_ndirty; i++) {
-		if (oh->ot_dirty[i] == inode)
-			return;
-	}
-
-	if (oh->ot_ndirty >= OSD_TH_MAX_DIRTY) {
-		/*
-		 * More buffered writes than the array holds. Rather than
-		 * allocate, remember that the list is incomplete and flush
-		 * everything at trans_stop. Correct, slower, and rare.
-		 */
-		oh->ot_dirty_overflow = 1;
-		return;
-	}
-
-	oh->ot_dirty[oh->ot_ndirty++] = igrab(inode);
-}
-
-/*
- * Drop the inode references this transaction is holding.
- *
- * Must run for every transaction, on every path, including the failures.
- * Leaking an igrab() keeps the inode alive, which keeps its dquot alive, and
- * unmount then spins for ever in xfs_qm_dquot_walk() waiting to purge it. That
- * is exactly what happened when this was first written with the flush inside
- * an "if (rc == 0)" branch.
- */
-void osd_trans_drop_dirty(struct osd_thandle *oh)
-{
-	int i;
-
-	for (i = 0; i < oh->ot_ndirty; i++) {
-		if (oh->ot_dirty[i] != NULL)
-			iput(oh->ot_dirty[i]);
-		oh->ot_dirty[i] = NULL;
-	}
-	oh->ot_ndirty = 0;
-	oh->ot_dirty_overflow = 0;
-}
-
-/*
- * Write this transaction's buffered pages out to the device.
- *
- * Deliberately does NOT issue a device cache flush: the caller forces the
- * log afterwards, which flushes the device cache. Returns true if anything
- * was written and a flush is therefore owed.
- */
-bool osd_trans_writeback_dirty(const struct lu_env *env,
-			       struct osd_device *osd,
-			       struct osd_thandle *oh, int *rcp)
-{
-	bool written = false;
-	int rc = 0;
-	int i;
-
-	/*
-	 * The tunable exists to attribute cost, not to tune. With it off, a
-	 * commit callback can report a transno durable while it is still only
-	 * in the page cache.
-	 */
-	if (!osd->od_flush_buffered) {
-		osd_trans_drop_dirty(oh);
-		return false;
-	}
-
-	if (unlikely(oh->ot_dirty_overflow)) {
-		struct super_block *sb = osd_sb(osd);
-
-		/*
-		 * More buffered writes in one transaction than the array
-		 * holds, so the tracked list is incomplete and flushing only
-		 * what is in it would miss some. Flush everything instead:
-		 * correct, much slower, and it should never happen.
-		 */
-		CWARN("%s: more than %d buffered writes in one transaction, flushing the whole filesystem\n",
-		      osd_name(osd), OSD_TH_MAX_DIRTY);
-		if (sb != NULL)
-			rc = sync_filesystem(sb);
-		written = true;
-	}
-
-	for (i = 0; i < oh->ot_ndirty; i++) {
-		struct inode *inode = oh->ot_dirty[i];
-		int rc2;
-
-		if (inode == NULL)
-			continue;
-		rc2 = filemap_write_and_wait(inode->i_mapping);
-		written = true;
-		if (rc2 != 0 && rc == 0)
-			rc = rc2;
-		iput(inode);
-		oh->ot_dirty[i] = NULL;
-	}
-	oh->ot_ndirty = 0;
-	oh->ot_dirty_overflow = 0;
-
-	if (rcp != NULL && rc != 0 && *rcp == 0)
-		*rcp = rc;
-
-	return written;
-}
-
 static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 			  struct thandle *th)
 {
 	struct osd_thandle *oh = osd_thandle(th);
 	struct osd_device *osd = osd_dt_dev(dt);
-	int rc, hook_rc;
-	bool mutated = oh->ot_mutated || oh->ot_ndirty ||
-		       oh->ot_dirty_overflow;
+	int rc, hook_rc, i;
+	bool mutated = oh->ot_ndirty || oh->ot_dirty_overflow;
 
 	ENTRY;
 
-	if (oh->ot_start_error && !th->th_result)
-		th->th_result = oh->ot_start_error;
+	/* Admission reservations must be released on every exit. */
+	if (oh->ot_res_error && !th->th_result)
+		th->th_result = oh->ot_res_error;
+	for (i = 0; i < OSD_OT_MAX; i++)
+		mutated |= oh->ot_exec_ops[i] != 0;
 
 	mutex_lock(&osd->od_publish_lock);
 	/*
 	 * No execution means no recovery publication, even after a successful
-	 * start. Executed VFS operations may have partially mutated state: an
-	 * error there remains conservatively fatal.
+	 * start. In particular, advisory admission failure must not write
+	 * last_rcvd or poison the target. Executed VFS operations may have
+	 * partially mutated state: an error there remains conservatively fatal.
 	 */
 	rc = osd_commit_error(osd, 0);
 	if (rc == 0 && th->th_result != 0 && mutated)
@@ -634,6 +523,7 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 			rc = rc2;
 	}
 	osd_trans_drop_dirty(oh);
+	osd_reserve_release(osd, oh);
 	rc = osd_trans_complete(env, osd, oh, rc);
 	mutex_unlock(&osd->od_publish_lock);
 	OBD_FREE_PTR(oh);
@@ -841,7 +731,7 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	if (rc != 0)
 		GOTO(out_map, rc);
 
-	o->od_flush_buffered = 1;
+	osd_reserve_init(o);
 
 	/*
 	 * Register under od_svname, not name. `name` is the OSD device name

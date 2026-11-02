@@ -58,6 +58,19 @@ static ssize_t osd_read(const struct lu_env *env, struct dt_object *dt,
 	return rc;
 }
 
+static ssize_t osd_declare_write(const struct lu_env *env,
+				 struct dt_object *dt,
+				 const struct lu_buf *buf, loff_t pos,
+				 struct thandle *handle)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	u64 blocksize = osd_sb(osd_obj2dev(obj))->s_blocksize;
+	u64 blocks = DIV_ROUND_UP_ULL(buf->lb_len, blocksize) + 1;
+
+	/* pos may be -1 and lb_buf NULL during reply-data declaration. */
+	osd_declare_op(handle, OSD_OT_WRITE, blocks, 0);
+	return 0;
+}
 
 static ssize_t osd_write(const struct lu_env *env, struct dt_object *dt,
 			 const struct lu_buf *buf, loff_t *pos,
@@ -70,7 +83,7 @@ static ssize_t osd_write(const struct lu_env *env, struct dt_object *dt,
 		rc = osd_commit_error(osd_obj2dev(obj), 0);
 		if (rc)
 			return rc;
-		osd_trans_mutated(handle);
+		osd_exec_op(env, handle, OSD_OT_WRITE, 0, 0);
 	}
 
 	/*
@@ -343,6 +356,48 @@ static int osd_write_prep(const struct lu_env *env, struct dt_object *dt,
 	return 0;
 }
 
+static int osd_declare_write_commit(const struct lu_env *env,
+				    struct dt_object *dt,
+				    struct niobuf_local *lnb, int npages,
+				    struct thandle *handle)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	struct inode *inode = obj->oo_inode;
+	long long space = 0;
+	int i;
+
+	ENTRY;
+
+	if (inode == NULL)
+		RETURN(-ENOENT);
+
+	/*
+	 * Declare the buffers that are not already allocated on disk. A
+	 * rewrite of existing blocks consumes no new space.
+	 *
+	 * For a write, lnb_hole is the caller's statement that this range was
+	 * not there before.
+	 */
+	for (i = 0; i < npages; i++) {
+		if (lnb[i].lnb_rc == -ENOSPC || lnb[i].lnb_len == 0)
+			continue;
+		if (lnb[i].lnb_file_offset >= i_size_read(inode) ||
+		    lnb[i].lnb_hole)
+			space += lnb[i].lnb_len;
+	}
+
+	/*
+	 * Declare the space, so the reservation can ask whether the
+	 * filesystem has it at all: a transaction that has started must not
+	 * be able to fail on it.
+	 */
+	osd_declare_op(handle, OSD_OT_WRITE,
+		       (space + (1 << inode->i_blkbits) - 1) >>
+		       inode->i_blkbits, 0);
+
+	RETURN(0);
+}
+
 static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 			    struct niobuf_local *lnb, int npages,
 			    struct thandle *handle, __u64 user_size)
@@ -368,7 +423,7 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 	 */
 	if (CFS_FAIL_CHECK(OBD_FAIL_OST_MAPBLK_ENOSPC))
 		RETURN(-ENOSPC);
-	osd_trans_mutated(handle);
+	osd_exec_op(env, handle, OSD_OT_WRITE, 0, 0);
 
 	/*
 	 * Track before attempting I/O: a short write or data-sync error can
@@ -427,6 +482,20 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 /* truncate / punch                                                    */
 /* ------------------------------------------------------------------ */
 
+static int osd_declare_punch(const struct lu_env *env, struct dt_object *dt,
+			     __u64 start, __u64 end, struct thandle *th)
+{
+	/*
+	 * A punch frees space, but freeing is not always free: splitting an
+	 * extent to remove a range from the middle needs a block for the new
+	 * extent record. Declare one so a truncate cannot be the operation
+	 * that runs out of space.
+	 */
+	osd_declare_op(th, OSD_OT_PUNCH, OSD_DECL_BLK_PUNCH, 0);
+
+	return 0;
+}
+
 static int osd_punch(const struct lu_env *env, struct dt_object *dt,
 		     __u64 start, __u64 end, struct thandle *th)
 {
@@ -450,7 +519,7 @@ static int osd_punch(const struct lu_env *env, struct dt_object *dt,
 		       osd_name(osd), start, end);
 		RETURN(-EOPNOTSUPP);
 	}
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_PUNCH, 0, 0);
 
 	/*
 	 * do_truncate() is not exported to modules and vfs_truncate() would
@@ -492,23 +561,28 @@ static loff_t osd_lseek(const struct lu_env *env, struct dt_object *dt,
 /*
  * Body operations for an object that does not exist yet.
  *
- * Lustre calls dt_declare_record_write() on an object before dt_create(),
- * and dt_declare_record_write() asserts do_body_ops is non-NULL. This
- * backend has no declare method, so a not-yet-created object needs a vector
- * that is empty. osd-ldiskfs keeps an osd_body_ops_new for the same reason;
- * without it the first mount LBUGs.
+ * The declare phase runs before dt_create(), so Lustre legitimately calls
+ * dt_declare_record_write() on an object with no inode.
+ * dt_declare_record_write() asserts do_body_ops is non-NULL, so a
+ * not-yet-created object still needs a vector -- just one that can only
+ * declare. osd-ldiskfs does the same with osd_body_ops_new; without it the
+ * first mount LBUGs.
  */
 const struct dt_body_operations osd_body_ops_new = {
+	.dbo_declare_write	  = osd_declare_write,
 };
 
 const struct dt_body_operations osd_body_ops = {
 	.dbo_read		  = osd_read,
+	.dbo_declare_write	  = osd_declare_write,
 	.dbo_write		  = osd_write,
 	.dbo_bufs_get		  = osd_bufs_get,
 	.dbo_bufs_put		  = osd_bufs_put,
 	.dbo_write_prep		  = osd_write_prep,
+	.dbo_declare_write_commit = osd_declare_write_commit,
 	.dbo_write_commit	  = osd_write_commit,
 	.dbo_read_prep		  = osd_read_prep,
+	.dbo_declare_punch	  = osd_declare_punch,
 	.dbo_punch		  = osd_punch,
 	.dbo_lseek		  = osd_lseek,
 };

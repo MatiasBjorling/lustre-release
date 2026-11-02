@@ -106,11 +106,10 @@ static int osd_lu_object_init(const struct lu_env *env, struct lu_object *l,
 	LASSERT(obj->oo_inode == NULL);
 
 	/*
-	 * Give the object a body vector up front. dt_declare_record_write()
-	 * asserts on a NULL do_body_ops even though this backend has no
-	 * declare method, and Lustre calls it before the object exists.
-	 * osd_object_init0() upgrades it to the full vector once there is
-	 * an inode.
+	 * Give the object a declare-only body vector up front. Lustre may
+	 * declare a write before the object exists, and dt_declare_record_write()
+	 * asserts on a NULL do_body_ops. osd_object_init0() upgrades it to the
+	 * full vector once there is an inode.
 	 */
 	obj->oo_dt.do_body_ops = &osd_body_ops_new;
 
@@ -280,6 +279,39 @@ static int osd_attr_get(const struct lu_env *env, struct dt_object *dt,
 	return 0;
 }
 
+static int osd_declare_attr_set(const struct lu_env *env, struct dt_object *dt,
+				const struct lu_attr *attr,
+				struct thandle *th)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	struct inode *inode = obj->oo_inode;
+	__u64 blocks = OSD_DECL_BLK_ATTR_SET;
+
+	/*
+	 * A size increase is the only attribute change that can consume
+	 * space, so it is the only one costed beyond the flat charge.
+	 *
+	 * Both pointers really can be NULL. The inode may not exist yet,
+	 * because Lustre declares an attr_set alongside the create that
+	 * precedes it, and there is then no size to grow from. And @attr
+	 * itself is NULL from the llog code, which declares an attr_set in
+	 * five places without saying what it will change; dt_declare_attr_set()
+	 * passes that straight through. Dereferencing it oopsed the OSS during
+	 * mount.
+	 */
+	if (inode != NULL && attr != NULL && (attr->la_valid & LA_SIZE)) {
+		__u64 size = i_size_read(inode);
+
+		if (attr->la_size > size)
+			blocks += (attr->la_size - size +
+				   i_blocksize(inode) - 1) >> inode->i_blkbits;
+	}
+
+	osd_declare_op(th, OSD_OT_ATTR_SET, blocks, 0);
+
+	return 0;
+}
+
 /*
  * Translate the Lustre attributes this backend applies into one XFS update.
  *
@@ -345,7 +377,7 @@ static int osd_attr_set(const struct lu_env *env, struct dt_object *dt,
 	if (inode == NULL)
 		return -ENOENT;
 
-	osd_trans_mutated(handle);
+	osd_exec_op(env, handle, OSD_OT_ATTR_SET, 0, 0);
 
 	rc = osd_attr_to_xfs(attr, &xa);
 	if (rc)
@@ -394,6 +426,30 @@ static int osd_xattr_get(const struct lu_env *env, struct dt_object *dt,
 	return rc;
 }
 
+/*
+ * Costed for a remote attribute block. A value that fits in the inode's
+ * literal area needs no block at all, but which case this is depends on what
+ * else the inode already carries, and that cannot be known here.
+ */
+static int osd_declare_xattr_set(const struct lu_env *env,
+				 struct dt_object *dt,
+				 const struct lu_attr *attr,
+				 const struct lu_buf *buf, const char *name,
+				 int fl, struct thandle *th)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	unsigned int bits = obj->oo_inode ? obj->oo_inode->i_blkbits :
+		osd_sb(osd_obj2dev(obj))->s_blocksize_bits;
+	u64 bytes = buf ? buf->lb_len : XATTR_SIZE_MAX;
+
+	if (bytes > XATTR_SIZE_MAX)
+		return -E2BIG;
+	osd_declare_op(th, OSD_OT_XATTR_SET,
+		       OSD_DECL_BLK_XATTR_SET + DIV_ROUND_UP_ULL(bytes, 1U << bits), 0);
+
+	return 0;
+}
+
 static int osd_xattr_set(const struct lu_env *env, struct dt_object *dt,
 			 const struct lu_buf *buf, const char *name, int fl,
 			 struct thandle *handle)
@@ -409,11 +465,7 @@ static int osd_xattr_set(const struct lu_env *env, struct dt_object *dt,
 		goto failed;
 	}
 
-	/* __vfs_setxattr() leaves the size limit to the syscall layer */
-	if (buf->lb_len > XATTR_SIZE_MAX)
-		return -E2BIG;
-
-	osd_trans_mutated(handle);
+	osd_exec_op(env, handle, OSD_OT_XATTR_SET, 0, 0);
 
 	if (fl & LU_XATTR_CREATE)
 		flags |= XATTR_CREATE;
@@ -439,6 +491,19 @@ failed:
 	return rc;
 }
 
+/*
+ * Zero cost: a removal only frees space. It is still declared, so that the
+ * execute side is not counted as having run without one.
+ */
+static int osd_declare_xattr_del(const struct lu_env *env,
+				 struct dt_object *dt, const char *name,
+				 struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_XATTR_DEL, 0, 0);
+
+	return 0;
+}
+
 static int osd_xattr_del(const struct lu_env *env, struct dt_object *dt,
 			 const char *name, struct thandle *handle)
 {
@@ -450,7 +515,7 @@ static int osd_xattr_del(const struct lu_env *env, struct dt_object *dt,
 	if (inode == NULL)
 		return -ENOENT;
 
-	osd_trans_mutated(handle);
+	osd_exec_op(env, handle, OSD_OT_XATTR_DEL, 0, 0);
 
 	dentry.d_inode = inode;
 	dentry.d_sb = inode->i_sb;
@@ -497,6 +562,20 @@ static void osd_ah_init(const struct lu_env *env, struct dt_allocation_hint *ah,
 	ah->dah_parent = parent;
 }
 
+static int osd_declare_create(const struct lu_env *env, struct dt_object *dt,
+			      struct lu_attr *attr,
+			      struct dt_allocation_hint *hint,
+			      struct dt_object_format *dof,
+			      struct thandle *th)
+{
+	const struct lu_fid *fid = lu_object_fid(&dt->do_lu);
+
+	osd_declare_op(th, OSD_OT_CREATE, OSD_DECL_BLK_CREATE,
+		       OSD_DECL_INO_CREATE + !osd_fid_is_on_ost(fid));
+
+	return 0;
+}
+
 static int osd_create(const struct lu_env *env, struct dt_object *dt,
 		      struct lu_attr *attr, struct dt_allocation_hint *hint,
 		      struct dt_object_format *dof, struct thandle *th)
@@ -515,7 +594,7 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 	if (dt_object_exists(dt))
 		RETURN(-EEXIST);
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_CREATE, 0, 0);
 
 	switch (dof->dof_type) {
 	case DFT_REGULAR:
@@ -590,6 +669,14 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 	RETURN(0);
 }
 
+static int osd_declare_destroy(const struct lu_env *env, struct dt_object *dt,
+			       struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_DESTROY, 0, 0);
+
+	return 0;
+}
+
 /*
  * Destroy must be idempotent with respect to the name.
  *
@@ -618,7 +705,7 @@ static int osd_destroy(const struct lu_env *env, struct dt_object *dt,
 	if (!dt_object_exists(dt) || obj->oo_destroyed)
 		RETURN(-ENOENT);
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_DESTROY, 0, 0);
 
 	if (osd_fid_is_on_ost(fid)) {
 		/*
@@ -682,6 +769,19 @@ static int osd_destroy(const struct lu_env *env, struct dt_object *dt,
 	RETURN(rc);
 }
 
+/*
+ * Zero cost: i_nlink lives in the inode, and the name that the link count is
+ * being adjusted for is charged by the index operation that adds or removes
+ * it.
+ */
+static int osd_declare_ref_add(const struct lu_env *env, struct dt_object *dt,
+			       struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_REF_ADD, 0, 0);
+
+	return 0;
+}
+
 static int osd_ref_add(const struct lu_env *env, struct dt_object *dt,
 		       struct thandle *th)
 {
@@ -690,7 +790,15 @@ static int osd_ref_add(const struct lu_env *env, struct dt_object *dt,
 	if (obj->oo_inode == NULL)
 		return -ENOENT;
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_REF_ADD, 0, 0);
+
+	return 0;
+}
+
+static int osd_declare_ref_del(const struct lu_env *env, struct dt_object *dt,
+			       struct thandle *th)
+{
+	osd_declare_op(th, OSD_OT_REF_DEL, 0, 0);
 
 	return 0;
 }
@@ -703,7 +811,7 @@ static int osd_ref_del(const struct lu_env *env, struct dt_object *dt,
 	if (obj->oo_inode == NULL)
 		return -ENOENT;
 
-	osd_trans_mutated(th);
+	osd_exec_op(env, th, OSD_OT_REF_DEL, 0, 0);
 
 	return 0;
 }
@@ -750,8 +858,8 @@ static int osd_index_try(const struct lu_env *env, struct dt_object *dt,
 	 * "default". osd-ldiskfs makes the same split -- directory features to
 	 * the name index, everything else to IAM.
 	 *
-	 * NB: also called before the object exists, so a NULL inode must be
-	 * accepted.
+	 * NB: also called during the *declare* phase, before the object
+	 * exists, so a NULL inode must be accepted.
 	 */
 	/*
 	 * The object-table pseudo index. OFD starts layout LFSCK after
@@ -805,15 +913,22 @@ static int osd_index_try(const struct lu_env *env, struct dt_object *dt,
 
 const struct dt_object_operations osd_obj_ops = {
 	.do_attr_get		= osd_attr_get,
+	.do_declare_attr_set	= osd_declare_attr_set,
 	.do_attr_set		= osd_attr_set,
 	.do_xattr_get		= osd_xattr_get,
+	.do_declare_xattr_set	= osd_declare_xattr_set,
 	.do_xattr_set		= osd_xattr_set,
+	.do_declare_xattr_del	= osd_declare_xattr_del,
 	.do_xattr_del		= osd_xattr_del,
 	.do_xattr_list		= osd_xattr_list,
 	.do_ah_init		= osd_ah_init,
+	.do_declare_create	= osd_declare_create,
 	.do_create		= osd_create,
+	.do_declare_destroy	= osd_declare_destroy,
 	.do_destroy		= osd_destroy,
+	.do_declare_ref_add	= osd_declare_ref_add,
 	.do_ref_add		= osd_ref_add,
+	.do_declare_ref_del	= osd_declare_ref_del,
 	.do_ref_del		= osd_ref_del,
 	.do_index_try		= osd_index_try,
 	.do_object_sync		= osd_object_sync,
