@@ -558,9 +558,12 @@ static char *zfs_mkfs_opts(struct mkfs_opts *mop, char *str, int len)
 
 	if (strlen(mop->mo_mkfsopts) != 0)
 		snprintf(str, len, " -o %s", mop->mo_mkfsopts);
-	if (mop->mo_device_kb)
-		snprintf(str, len, " -o quota=%llu",
+	if (mop->mo_device_kb) {
+		size_t used = strlen(str);
+
+		snprintf(str + used, len - used, " -o quota=%llu",
 			 (unsigned long long)mop->mo_device_kb * 1024);
+	}
 
 	return str;
 }
@@ -691,8 +694,23 @@ int zfs_make_lustre(struct mkfs_opts *mop)
 	php = zpool_open(g_zfs, pool);
 	if (php) {
 		pool_exists = 1;
-		zpool_set_prop(php, "canmount", "off");
 		zpool_close(php);
+
+		/* canmount is a property of the pool's root dataset. */
+		zhp = zfs_open(g_zfs, pool, ZFS_TYPE_FILESYSTEM);
+		if (zhp == NULL) {
+			ret = EINVAL;
+			fprintf(stderr, "Failed to open zfs dataset %s\n", pool);
+			goto out;
+		}
+		ret = zfs_set_prop_str(zhp, "canmount", "off");
+		zfs_close(zhp);
+		if (ret) {
+			fatal();
+			fprintf(stderr, "Unable to set canmount=off on %s (%d)\n",
+				pool, ret);
+			goto out;
+		}
 	}
 
 	if ((mop->mo_pool_vdevs != NULL) && (pool_exists == 0)) {
@@ -727,7 +745,6 @@ int zfs_make_lustre(struct mkfs_opts *mop)
 	/*
 	 * Set Options on ZPOOL
 	 *
-	 * ALL   - canmount=off (set above)
 	 * 0.7.0 - multihost=on
 	 * 0.7.0 - feature@userobj_accounting=enabled
 	 */
@@ -760,13 +777,13 @@ int zfs_make_lustre(struct mkfs_opts *mop)
 	 * Attempt to set dataset properties to reasonable defaults
 	 * to optimize performance, unless the values were specified
 	 * at the mkfs command line. Some ZFS pools or ZFS versions
-	 * do not support these properties. We can safely ignore the
-	 * errors and continue in those cases.
+	 * do not support the optional performance properties listed
+	 * below; their errors are ignored for compatibility. Setting
+	 * the default compression property must succeed.
 	 *
 	 * zfs 0.6.1 - system attribute based xattrs
 	 * zfs 0.6.5 - large block support
 	 * zfs 0.7.0 - large dnode support
-	 * zfs 2.2.6 - compression handling
 	 *
 	 * Check if zhp is NULL as a defensive measure. Any dataset
 	 * validation errors that would cause zfs_open() to fail
@@ -774,8 +791,6 @@ int zfs_make_lustre(struct mkfs_opts *mop)
 	 */
 	zhp = zfs_open(g_zfs, ds, ZFS_TYPE_FILESYSTEM);
 	if (zhp) {
-		char *opt;
-
 		/* zfs 0.6.1 - system attribute based xattrs */
 		if (!strstr(mop->mo_mkfsopts, "xattr="))
 			zfs_set_prop_str(zhp, "xattr", "sa");
@@ -792,25 +807,25 @@ int zfs_make_lustre(struct mkfs_opts *mop)
 				zfs_set_prop_str(zhp, "recordsize", "1M");
 		}
 
-		/* zfs 2.2.6 - compression handling */
-		opt = strstr(mop->mo_mkfsopts, "compression=");
-		if (opt) {
-			char *end = index(opt, ',');
-			size_t len = strlen(opt);
-
-			if (end) {
-				len = end - opt;
-				end = strndup(opt, len);
+		/* Preserve compression already applied by zfs create. */
+		if (!strstr(mop->mo_mkfsopts, "compression=") &&
+		    !strstr(mop->mo_mkfsopts, "compress=")) {
+			ret = zfs_set_prop_str(zhp, "compression", "off");
+			if (ret) {
+				zfs_close(zhp);
+				fatal();
+				fprintf(stderr,
+					"Unable to set compression=off on %s (%d)\n",
+					ds, ret);
+				goto out;
 			}
-			zfs_set_prop_str(zhp, "compression", end ? end : opt);
-			if (end)
-				free(end);
-		} else {
-			/* By default turn off compression */
-			zfs_set_prop_str(zhp, "compression", "off");
 		}
 
 		zfs_close(zhp);
+	} else {
+		ret = EINVAL;
+		fprintf(stderr, "Failed to open zfs dataset %s\n", ds);
+		goto out;
 	}
 
 out:
