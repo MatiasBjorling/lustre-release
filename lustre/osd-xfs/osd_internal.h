@@ -285,6 +285,20 @@ struct osd_reservation {
 	__u32	or_inodes;
 };
 
+/* what one OI scrub pass found */
+struct osd_scrub_stats {
+	__u64	ss_scanned;	/* objects examined */
+	__u64	ss_ok;		/* already had a correct index entry */
+	__u64	ss_repaired;	/* entry inserted or corrected */
+	__u64	ss_no_lma;	/* no trusted.lma, so not indexable */
+	__u64	ss_derivable;	/* OST object, found by path, needs no entry */
+	__u64	ss_failed;	/* could not be repaired */
+	__u64	ss_too_deep;	/* below OSD_SCRUB_MAX_DEPTH */
+	__u64	ss_skipped_dirs;/* O/ and oi/, deliberately not walked */
+	__u64	ss_time_ms;
+	int	ss_rc;
+};
+
 struct osd_device {
 	struct dt_device	 od_dt_dev;
 
@@ -353,6 +367,12 @@ struct osd_device {
 	atomic64_t		 od_statfs_calls;
 	unsigned int		 od_declare_check:1;	/* warn on mismatch */
 
+	/* OI scrub state; see osd_scrub.c */
+	struct mutex		 od_scrub_mutex;
+	struct task_struct	*od_scrub_task;
+	struct osd_scrub_stats	 od_scrub_last;
+	unsigned int		 od_scrub_running:1;
+	unsigned int		 od_scrub_stop:1;
 	/*
 	 * procfs root for this target. Only needed because qsd_init() creates
 	 * its parameters under a proc_dir_entry; everything osd-xfs registers
@@ -605,6 +625,11 @@ bool osd_trans_writeback_dirty(const struct lu_env *env,
 bool osd_commit_writeback_batch(struct osd_device *osd,
 				struct list_head *batch, int *rcp);
 const char *osd_op_name(enum osd_op_type op);
+
+/* osd_scrub.c */
+int  osd_scrub_run(const struct lu_env *env, struct osd_device *dev);
+int  osd_scrub_start(struct osd_device *dev);
+void osd_scrub_stop(struct osd_device *dev);
 
 int  osd_oi_lookup(const struct lu_env *env, struct osd_device *dev,
 		   const struct lu_fid *fid, struct dentry **dentry);

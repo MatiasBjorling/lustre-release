@@ -144,6 +144,65 @@ static ssize_t osd_commit_delay_ms_seq_write(struct file *file,
 }
 LDEBUGFS_SEQ_FOPS(osd_commit_delay_ms);
 
+/*
+ * OI scrub: write 1 to start, 0 to stop; reading reports the last pass.
+ *
+ * The index maps a FID to an inode for every object whose location is not
+ * derivable from its FID. If it is lost those objects are unreachable even
+ * though their data is intact, and nothing else on disk holds that mapping.
+ */
+static int osd_scrub_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	struct osd_scrub_stats st;
+	bool running;
+
+	mutex_lock(&osd->od_scrub_mutex);
+	running = osd->od_scrub_running;
+	st = osd->od_scrub_last;
+	mutex_unlock(&osd->od_scrub_mutex);
+
+	seq_printf(m, "status:      %s\n", running ? "running" : "idle");
+	seq_printf(m, "scanned:     %llu\n", st.ss_scanned);
+	seq_printf(m, "correct:     %llu\n", st.ss_ok);
+	seq_printf(m, "rebuilt:     %llu\n", st.ss_repaired);
+	seq_printf(m, "no_lma:      %llu\n", st.ss_no_lma);
+	seq_printf(m, "by_path:     %llu\n", st.ss_derivable);
+	seq_printf(m, "failed:      %llu\n", st.ss_failed);
+	seq_printf(m, "too_deep:    %llu\n", st.ss_too_deep);
+	seq_printf(m, "skipped_dirs:%llu\n", st.ss_skipped_dirs);
+	seq_printf(m, "duration_ms: %llu\n", st.ss_time_ms);
+	seq_printf(m, "last_rc:     %d\n", st.ss_rc);
+
+	return 0;
+}
+
+static ssize_t osd_scrub_seq_write(struct file *file,
+				   const char __user *buffer,
+				   size_t count, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	bool val;
+	int rc;
+
+	rc = kstrtobool_from_user(buffer, count, &val);
+	if (rc)
+		return rc;
+
+	if (!val) {
+		osd_scrub_stop(osd);
+		return count;
+	}
+
+	rc = osd_scrub_start(osd);
+	if (rc == -EALREADY)
+		return count;
+
+	return rc ? rc : count;
+}
+LDEBUGFS_SEQ_FOPS(osd_scrub);
+
 
 /*
  * The declare phase and its reservation.
@@ -359,6 +418,8 @@ static struct ldebugfs_vars ldebugfs_osd_obd_vars[] = {
 	  .fops = &osd_commit_defer_fops },
 	{ .name = "commit_delay_ms",
 	  .fops = &osd_commit_delay_ms_fops },
+	{ .name = "oi_scrub",
+	  .fops = &osd_scrub_fops },
 	{ .name = "reserve",
 	  .fops = &osd_reserve_fops },
 	{ .name = "flush_buffered",

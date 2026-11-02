@@ -934,6 +934,8 @@ static int osd_shutdown(const struct lu_env *env, struct osd_device *o)
 	 * unmount. osd-ldiskfs releases it from its own osd_shutdown() for
 	 * the same reason.
 	 */
+	osd_scrub_stop(o);
+
 	if (o->od_quota_slave_dt != NULL) {
 		struct qsd_instance *qsd = o->od_quota_slave_dt;
 
@@ -1023,12 +1025,34 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	atomic64_set(&o->od_commit_batched, 0);
 	o->od_commit_defer = 1;
 	o->od_commit_delay_ms = OSD_COMMIT_DELAY_MS;
+	mutex_init(&o->od_scrub_mutex);
 	osd_reserve_init(o);
 	o->od_commit_wq = alloc_workqueue("osd_xfs_commit",
 					  WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
 	if (o->od_commit_wq == NULL)
 		CWARN("%s: no commit workqueue, forcing the log per transaction\n",
 		      osd_name(o));
+
+	/*
+	 * Verify the object index against the namespace before the target
+	 * starts serving.
+	 *
+	 * A lost oi/ entry does not present as a missing object; it presents
+	 * as -EEXIST at mount, because Lustre concludes the object is absent,
+	 * tries to create it, and the name is already there. The target then
+	 * refuses to mount at all, which means there is no opportunity to run
+	 * a scrub afterwards -- so it has to happen here.
+	 *
+	 * This is affordable only because O/ is skipped: the index covers the
+	 * few tens of objects whose location is not derivable from their FID,
+	 * not the data objects. Measured at 1 ms on a freshly formatted
+	 * target.
+	 */
+	rc = osd_scrub_run(env, o);
+	if (rc != 0)
+		CWARN("%s: OI scrub at mount failed, continuing: rc = %d\n",
+		      name, rc);
+	rc = 0;
 
 	/*
 	 * Register under od_svname, not name. `name` is the OSD device name
