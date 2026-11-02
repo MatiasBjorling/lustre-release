@@ -130,6 +130,7 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 	const char *opts;
 	unsigned long s_flags = 0, lmd_flags = 0;
 	struct file_system_type *type;
+	struct block_device *data_bdev;
 	char *options = NULL;
 	const char *str;
 	int rc = 0;
@@ -197,6 +198,7 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 		strncat(options, ",", PAGE_SIZE - strlen(options) - 1);
 		strncat(options, opts, PAGE_SIZE - strlen(options) - 1);
 	}
+	o->od_external_rt = strstr(options, ",rtdev=") != NULL;
 
 	type = get_fs_type(OSD_XFS_FSTYPE);
 	if (type == NULL) {
@@ -227,11 +229,23 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 	o->od_root_dentry = osd_sb(o)->s_root;
 
 	/*
+	 * Ask about the device the data is on. With an SSD for metadata and
+	 * the HDD as the realtime device, the primary device is the SSD and
+	 * says nothing about where objects live.
+	 */
+	data_bdev = xfs_osd_data_bdev(osd_sb(o));
+	if (data_bdev == NULL) {
+		mntput(o->od_mnt);
+		o->od_mnt = NULL;
+		GOTO(out, rc = -EINVAL);
+	}
+
+	/*
 	 * Flash-backed targets get nothing from the page cache; osd-ldiskfs
 	 * makes the same call. The same answer is kept for os_state, where
 	 * OS_STATFS_NONROT tells the MDT it may prefer this target.
 	 */
-	o->od_nonrotational = !blk_queue_rot(bdev_get_queue(osd_sb(o)->s_bdev));
+	o->od_nonrotational = !blk_queue_rot(bdev_get_queue(data_bdev));
 	if (o->od_nonrotational) {
 		o->od_writethrough_cache = 0;
 		o->od_read_cache = 0;
@@ -256,7 +270,7 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 	 * instead of failing. Leaving it at 0 advertises a feature the
 	 * filesystem will then reject on every call.
 	 */
-	if (bdev_is_zoned(osd_sb(o)->s_bdev)) {
+	if (bdev_is_zoned(data_bdev)) {
 		o->od_fallocate_zero_blocks = -1;
 		LCONSOLE_INFO("%s: %s is zoned, so fallocate cannot preallocate; punch and zero-range still work\n",
 			      name, dev);

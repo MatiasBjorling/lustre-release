@@ -380,6 +380,8 @@ struct osd_device {
 	unsigned int		 od_flush_buffered:1;
 	unsigned int		 od_reserve_check:1;	/* consult free space */
 	unsigned int		 od_nonrotational:1;	/* data on flash */
+	/* the XFS realtime device holds the data; metadata stays on the SSD */
+	unsigned int		 od_external_rt:1;
 	/*
 	 * How fallocate() behaves, matching osd-ldiskfs:
 	 *   -1  disabled, return -EOPNOTSUPP

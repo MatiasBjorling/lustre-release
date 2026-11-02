@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mntent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,14 +52,84 @@
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
 
+/* Only device-pairing options belong on the temporary backing mount. */
+static int xfs_add_device_options(const char *source, char *options, size_t len)
+{
+	char *copy, *cursor, *option;
+	int rc = 0;
+
+	if (source == NULL || source[0] == '\0')
+		return 0;
+	copy = strdup(source);
+	if (copy == NULL)
+		return -ENOMEM;
+	cursor = copy;
+	while ((option = strsep(&cursor, ",")) != NULL) {
+		if (strncmp(option, "rtdev=", 6) != 0 &&
+		    strncmp(option, "logdev=", 7) != 0)
+			continue;
+		if (strlen(options) + strlen(option) + 2 > len) {
+			rc = -E2BIG;
+			break;
+		}
+		if (options[0] != '\0')
+			strcat(options, ",");
+		strcat(options, option);
+	}
+	free(copy);
+	return rc;
+}
+
+/* Cold probes cannot read CONFIGS/mountdata before opening the RT device. */
+static int xfs_device_options(const char *dev, const char *explicit,
+			      char *options, size_t len)
+{
+	struct stat target, candidate;
+	struct mntent *entry;
+	FILE *table;
+	int rc = 0;
+
+	options[0] = '\0';
+	if (stat(dev, &target) != 0)
+		return -errno;
+	table = setmntent("/etc/fstab", "r");
+	if (table == NULL && errno != ENOENT)
+		return -errno;
+	if (table != NULL) {
+		while ((entry = getmntent(table)) != NULL) {
+			if (strcmp(entry->mnt_type, "xfs") != 0 &&
+			    strcmp(entry->mnt_type, "lustre") != 0 &&
+			    strcmp(entry->mnt_type, "lustre_tgt") != 0)
+				continue;
+			if (stat(entry->mnt_fsname, &candidate) != 0 ||
+			    !S_ISBLK(target.st_mode) ||
+			    !S_ISBLK(candidate.st_mode) ||
+			    candidate.st_rdev != target.st_rdev)
+				continue;
+			rc = xfs_add_device_options(entry->mnt_opts, options, len);
+			if (rc)
+				break;
+		}
+		endmntent(table);
+	}
+	if (rc == 0)
+		rc = xfs_add_device_options(explicit, options, len);
+	return rc;
+}
+
 static int xfs_mount_tmp(const char *dev, char *mntpt, size_t mntpt_len,
-			 int read_only)
+			 int read_only, const char *mountopts)
 {
 	char tmpl[] = XFS_MOUNT_TMPL;
+	char options[PATH_MAX * 2];
 	char *dir;
 	unsigned long flags = 0;
 	int rc;
 	int i;
+
+	rc = xfs_device_options(dev, mountopts, options, sizeof(options));
+	if (rc)
+		return rc;
 
 	dir = mkdtemp(tmpl);
 	if (dir == NULL) {
@@ -84,7 +155,7 @@ static int xfs_mount_tmp(const char *dev, char *mntpt, size_t mntpt_len,
 	 */
 	rc = 0;
 	for (i = 0; i < XFS_MOUNT_TRIES; i++) {
-		if (mount(dev, dir, "xfs", flags, NULL) == 0) {
+		if (mount(dev, dir, "xfs", flags, options) == 0) {
 			rc = 0;
 			break;
 		}
@@ -135,7 +206,8 @@ int xfs_write_ldd(struct mkfs_opts *mop)
 	if (mop->mo_flags & MO_IS_LOOP)
 		dev = mop->mo_loopdev;
 
-	rc = xfs_mount_tmp(dev, mntpt, sizeof(mntpt), 0);
+	rc = xfs_mount_tmp(dev, mntpt, sizeof(mntpt), 0,
+			   mop->mo_mountopts ?: ldd->ldd_mount_opts);
 	if (rc)
 		return rc;
 
@@ -184,7 +256,7 @@ int xfs_read_ldd(char *dev, struct lustre_disk_data *ldd)
 	FILE *filep;
 	int rc;
 
-	rc = xfs_mount_tmp(dev, mntpt, sizeof(mntpt), 1);
+	rc = xfs_mount_tmp(dev, mntpt, sizeof(mntpt), 1, NULL);
 	if (rc)
 		return rc;
 
@@ -275,14 +347,10 @@ int xfs_make_lustre(struct mkfs_opts *mop)
 
 	if (!(mop->mo_flags & MO_FORCEFORMAT) &&
 	    xfs_is_xfs(mop->mo_device)) {
-		enum ldd_mount_type mt;
-
-		if (xfs_is_lustre(mop->mo_device, &mt)) {
-			fprintf(stderr,
-				"%s: %s is already a Lustre target; use --reformat to overwrite\n",
-				progname, mop->mo_device);
-			return -EEXIST;
-		}
+		fprintf(stderr,
+			"%s: %s already contains XFS; use --reformat to overwrite\n",
+			progname, mop->mo_device);
+		return -EEXIST;
 	}
 
 	dev = mop->mo_device;

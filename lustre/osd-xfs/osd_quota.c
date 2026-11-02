@@ -119,7 +119,7 @@ static int osd_acct_index_lookup(const struct lu_env *env,
 	if (rc)
 		RETURN(rc);
 
-	acct->bspace = dqblk.d_space;
+	acct->bspace = dqblk.d_space + dqblk.d_rt_space;
 	acct->ispace = dqblk.d_ino_count;
 
 	/* dt_lookup() maps >0 to "found" */
@@ -256,7 +256,7 @@ static int osd_it_acct_rec(const struct lu_env *env, const struct dt_it *di,
 	if (!it->oiq_valid)
 		return -ENOENT;
 
-	acct->bspace = it->oiq_dqblk.d_space;
+	acct->bspace = it->oiq_dqblk.d_space + it->oiq_dqblk.d_rt_space;
 	acct->ispace = it->oiq_dqblk.d_ino_count;
 
 	return 0;

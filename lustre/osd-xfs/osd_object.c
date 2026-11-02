@@ -802,6 +802,11 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 	 * The inode, its name, trusted.lma and the initial mode, owner and
 	 * times are one XFS transaction, so a crash leaves all of them or
 	 * none: never a named inode without an identity.
+	 *
+	 * Recovery and configuration files (everything but OST data objects,
+	 * plus each LAST_ID) are small records rewritten in place; keep them
+	 * on the metadata device rather than inheriting the realtime flag
+	 * that sends bulk objects to the HDD.
 	 */
 	memset(&xa, 0, sizeof(xa));
 	if (attr != NULL) {
@@ -810,6 +815,9 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 			RETURN(rc);
 	}
 	xa.valid &= ~XFS_OSD_SET_PROJID;
+	if (osd->od_external_rt &&
+	    (!osd_fid_is_on_ost(fid) || fid_is_last_id(fid)))
+		xa.valid |= XFS_OSD_NO_REALTIME;
 	osd_lma_build(env, fid, &lma);
 
 	if (osd_fid_is_on_ost(fid)) {

@@ -31,11 +31,14 @@ LB_CHECK_COMPILE([for the XFS single-transaction object API], xfs_osd_api, [
 			 const struct xfs_osd_xattr *, unsigned int))0));
 	BUILD_BUG_ON(!__same_type(&xfs_osd_setattr,
 		(int (*)(struct dentry *, const struct xfs_osd_attr *))0));
+	BUILD_BUG_ON(!__same_type(&xfs_osd_data_bdev,
+		(struct block_device *(*)(struct super_block *))0));
 	(void)vfs_fiemap_kernel;
 ], [
 	xfs_osd_api=yes
 	LB_CHECK_EXPORT([xfs_osd_create], [], [], [xfs_osd_api=no])
 	LB_CHECK_EXPORT([xfs_osd_setattr], [], [], [xfs_osd_api=no])
+	LB_CHECK_EXPORT([xfs_osd_data_bdev], [], [], [xfs_osd_api=no])
 	LB_CHECK_EXPORT([vfs_fiemap_kernel], [], [], [xfs_osd_api=no])
 ])
 ]) # LB_XFS_OSD_API
