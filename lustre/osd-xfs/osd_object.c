@@ -24,8 +24,8 @@
 /* LMA (trusted.lma): the authoritative FID of an object              */
 /* ------------------------------------------------------------------ */
 
-int osd_lma_get(const struct lu_env *env, struct inode *inode,
-		struct lu_fid *fid)
+int osd_lma_get_flags(const struct lu_env *env, struct inode *inode,
+		      struct lu_fid *fid, __u32 *lma_flags)
 {
 	struct osd_thread_info *info = osd_oti_get(env);
 	struct lustre_mdt_attrs *lma = &info->oti_mdt_attrs;
@@ -45,8 +45,16 @@ int osd_lma_get(const struct lu_env *env, struct inode *inode,
 	lustre_lma_swab(lma);
 	if (fid != NULL)
 		*fid = lma->lma_self_fid;
+	if (lma_flags != NULL)
+		*lma_flags = lma->lma_incompat & LMAI_ENCRYPT;
 
 	return 0;
+}
+
+int osd_lma_get(const struct lu_env *env, struct inode *inode,
+		struct lu_fid *fid)
+{
+	return osd_lma_get_flags(env, inode, fid, NULL);
 }
 
 /* The identity xattr every object is created with, in the thread's buffer. */
@@ -61,6 +69,45 @@ void osd_lma_build(const struct lu_env *env, const struct lu_fid *fid,
 	xattr->name = XATTR_NAME_LMA;
 	xattr->value = lma;
 	xattr->size = sizeof(*lma);
+}
+
+/*
+ * Update just the incompat flags of an existing LMA.
+ *
+ * The only one an OST cares about is LMAI_ENCRYPT, which records that the
+ * object holds client-encrypted content. The OST never has a key and never
+ * looks at the data; it needs the flag so that a truncate lands on an
+ * encryption unit boundary, and so the fact survives a remount and can be
+ * reported back upward.
+ */
+int osd_lma_set_flags(const struct lu_env *env, struct inode *inode,
+		      __u32 lma_flags)
+{
+	struct osd_thread_info *info = osd_oti_get(env);
+	struct lustre_mdt_attrs *lma = &info->oti_mdt_attrs;
+	struct dentry dentry = {};
+	int rc;
+
+	dentry.d_inode = inode;
+	dentry.d_sb = inode->i_sb;
+
+	rc = __vfs_getxattr(&dentry, inode, XATTR_NAME_LMA, lma, sizeof(*lma));
+	if (rc < 0)
+		return rc;
+	if (rc < sizeof(*lma))
+		return -EINVAL;
+
+	lustre_lma_swab(lma);
+	if ((lma->lma_incompat & LMAI_ENCRYPT) ==
+	    (lma_flags & LMAI_ENCRYPT))
+		return 0;			/* already right */
+
+	lma->lma_incompat &= ~LMAI_ENCRYPT;
+	lma->lma_incompat |= lma_flags & LMAI_ENCRYPT;
+	lustre_lma_swab(lma);
+
+	return __vfs_setxattr(&nop_mnt_idmap, &dentry, inode, XATTR_NAME_LMA,
+			      lma, sizeof(*lma), XATTR_REPLACE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -160,6 +207,13 @@ static int osd_lu_object_init(const struct lu_env *env, struct lu_object *l,
 
 	obj->oo_dentry = dentry;
 	obj->oo_inode = igrab(d_inode(dentry));
+
+	/*
+	 * Pick up LMAI_ENCRYPT. The OST has no key and never looks at the
+	 * data, but it has to know that the content is encrypted so a
+	 * truncate lands on an encryption unit boundary.
+	 */
+	osd_lma_get_flags(env, obj->oo_inode, NULL, &obj->oo_lma_flags);
 
 	/* Recovery may change size: complete it before exposing record reads. */
 	if (osd_rec_logged(obj)) {
@@ -300,6 +354,7 @@ static void osd_inode_getattr(const struct lu_env *env, struct inode *inode,
 	attr->la_uid    = i_uid_read(inode);
 	attr->la_gid    = i_gid_read(inode);
 	attr->la_projid = osd_get_projid(inode);
+	/* the encryption flag lives in the LMA, and is added by the caller */
 	attr->la_flags  = 0;
 	attr->la_nlink  = inode->i_nlink;
 	attr->la_rdev   = inode->i_rdev;
@@ -334,6 +389,13 @@ static int osd_attr_get(const struct lu_env *env, struct dt_object *dt,
 
 	down_read(&obj->oo_guard);
 	osd_inode_getattr(env, obj->oo_inode, obj->oo_dentry, attr);
+	/*
+	 * The only flag an OST object carries is "this content is encrypted",
+	 * which is kept in the LMA rather than in the inode. It has to be
+	 * reported so it reaches the client, which is the only party holding a
+	 * key.
+	 */
+	attr->la_flags |= lma_to_lustre_flags(obj->oo_lma_flags);
 	up_read(&obj->oo_guard);
 	/*
 	 * A small record's body is its attribute, not file data. Callers
@@ -475,6 +537,29 @@ static int osd_attr_set(const struct lu_env *env, struct dt_object *dt,
 			       PFID(lu_object_fid(&dt->do_lu)), attr->la_valid,
 			       rc);
 			return rc;
+		}
+	}
+
+	/*
+	 * The only flag an OST object carries is "this content is encrypted",
+	 * kept in the LMA rather than in i_flags. On ext4 the inode flag would
+	 * make ext4's own fscrypt interpret a file whose key lives on a
+	 * client; XFS has no fscrypt, so there is nothing to strip.
+	 */
+	if (attr->la_valid & LA_FLAGS) {
+		__u32 want = lustre_to_lma_flags(attr->la_flags);
+
+		if ((obj->oo_lma_flags & LMAI_ENCRYPT) !=
+		    (want & LMAI_ENCRYPT)) {
+			rc = osd_lma_set_flags(env, inode, want);
+			if (rc) {
+				CDEBUG(D_INODE,
+				       "%s: cannot record encryption flag: rc = %d\n",
+				       osd_name(osd_obj2dev(obj)), rc);
+				return rc;
+			}
+			obj->oo_lma_flags = (obj->oo_lma_flags & ~LMAI_ENCRYPT) |
+					    (want & LMAI_ENCRYPT);
 		}
 	}
 

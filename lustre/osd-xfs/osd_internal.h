@@ -207,6 +207,7 @@ struct osd_object {
 	u8			 oo_rec_len;
 	u8			 oo_rec_val[OSD_REC_SMALL_MAX];
 
+	__u32			 oo_lma_flags;
 	unsigned int		 oo_destroyed:1;
 
 	/*
@@ -684,6 +685,10 @@ struct lu_object *osd_object_alloc(const struct lu_env *env,
 
 int osd_lma_get(const struct lu_env *env, struct inode *inode,
 		struct lu_fid *fid);
+int osd_lma_get_flags(const struct lu_env *env, struct inode *inode,
+		      struct lu_fid *fid, __u32 *lma_flags);
+int osd_lma_set_flags(const struct lu_env *env, struct inode *inode,
+		      __u32 lma_flags);
 void osd_lma_build(const struct lu_env *env, const struct lu_fid *fid,
 		   struct xfs_osd_xattr *xattr);
 

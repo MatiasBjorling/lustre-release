@@ -1302,6 +1302,29 @@ static int osd_punch(const struct lu_env *env, struct dt_object *dt,
 		RETURN(osd_rec_resize(obj, start));
 
 	/*
+	 * Content encrypted on the client is enciphered in
+	 * LUSTRE_ENCRYPTION_UNIT_SIZE (4096 byte) units, each with an IV
+	 * derived from its logical offset. Truncating to an offset inside a
+	 * unit leaves a partial unit that cannot be deciphered, and the client
+	 * reads back garbage for it -- silently, since nothing on this side
+	 * can tell plaintext from nonsense.
+	 *
+	 * So round the truncation point up to the next unit boundary. Keeping
+	 * a few extra bytes is harmless; the client knows the real size.
+	 * osd-zfs does the same in its punch.
+	 */
+	if (obj->oo_lma_flags & LMAI_ENCRYPT &&
+	    start & ~LUSTRE_ENCRYPTION_MASK) {
+		__u64 aligned = (start & LUSTRE_ENCRYPTION_MASK) +
+				LUSTRE_ENCRYPTION_UNIT_SIZE;
+
+		CDEBUG(D_INODE,
+		       "%s: encrypted object, rounding truncate %llu -> %llu\n",
+		       osd_name(osd), start, aligned);
+		start = aligned;
+	}
+
+	/*
 	 * do_truncate() is not exported to modules and vfs_truncate() would
 	 * redo permission checks on a path we already hold, so drive
 	 * notify_change() directly. ATTR_FORCE skips the may_setattr() checks
