@@ -335,6 +335,127 @@ static ssize_t osd_reserve_check_seq_write(struct file *file,
 LDEBUGFS_SEQ_FOPS(osd_reserve_check);
 
 /*
+ * osd-*.<target>.nonrotational, as a sysfs attribute rather than a debugfs
+ * one because that is where callers look for it: sanity 56c writes
+ * osd-*.$ost.nonrotational to force the OS_STATFS_NONROT bit on and check
+ * the status letters the client derives from it. Writable for the same
+ * reason osd-ldiskfs makes it writable: the autodetection reads
+ * blk_queue_rot(), which is wrong for a spindle behind a flash cache or a
+ * VM's virtio disk, and an operator has to be able to correct it.
+ */
+static ssize_t nonrotational_show(struct kobject *kobj, struct attribute *attr,
+				  char *buf)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	return sprintf(buf, "%u\n", osd->od_nonrotational);
+}
+
+static ssize_t nonrotational_store(struct kobject *kobj,
+				   struct attribute *attr, const char *buffer,
+				   size_t count)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+	bool val;
+	int rc;
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	rc = kstrtobool(buffer, &val);
+	if (rc)
+		return rc;
+
+	osd->od_nonrotational = val;
+	return count;
+}
+LUSTRE_RW_ATTR(nonrotational);
+
+/*
+ * osd-*.<target>.read_cache_enable and .writethrough_cache_enable, set from
+ * the data device's rotational flag at mount. sanity 151 and 156 read the
+ * OST read-cache hit counter and need these to establish their precondition;
+ * osd-ldiskfs exposes both as writable, and the tests set them.
+ */
+static ssize_t read_cache_enable_show(struct kobject *kobj,
+				      struct attribute *attr, char *buf)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	return sprintf(buf, "%u\n", osd->od_read_cache);
+}
+
+static ssize_t read_cache_enable_store(struct kobject *kobj,
+				       struct attribute *attr,
+				       const char *buffer, size_t count)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+	bool val;
+	int rc;
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	rc = kstrtobool(buffer, &val);
+	if (rc)
+		return rc;
+
+	osd->od_read_cache = !!val;
+	return count;
+}
+LUSTRE_RW_ATTR(read_cache_enable);
+
+static ssize_t writethrough_cache_enable_show(struct kobject *kobj,
+					      struct attribute *attr,
+					      char *buf)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	return sprintf(buf, "%u\n", osd->od_writethrough_cache);
+}
+
+static ssize_t writethrough_cache_enable_store(struct kobject *kobj,
+					       struct attribute *attr,
+					       const char *buffer, size_t count)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+	bool val;
+	int rc;
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	rc = kstrtobool(buffer, &val);
+	if (rc)
+		return rc;
+
+	osd->od_writethrough_cache = !!val;
+	return count;
+}
+LUSTRE_RW_ATTR(writethrough_cache_enable);
+
+/*
  * osd-*.<target>.fallocate_zero_blocks.
  *
  * check_set_fallocate() in the test framework reads this before any
@@ -387,6 +508,9 @@ static ssize_t fallocate_zero_blocks_store(struct kobject *kobj,
 LUSTRE_RW_ATTR(fallocate_zero_blocks);
 
 static struct attribute *xfs_attrs[] = {
+	&lustre_attr_nonrotational.attr,
+	&lustre_attr_read_cache_enable.attr,
+	&lustre_attr_writethrough_cache_enable.attr,
 	&lustre_attr_fallocate_zero_blocks.attr,
 	NULL,
 };
@@ -519,6 +643,37 @@ int osd_procfs_init(struct osd_device *osd, const char *name)
 	}
 
 	/*
+	 * osd-xfs.<target>.stats. Only the three cache counters, because
+	 * those are the ones a caller can act on and the ones the test suite
+	 * reads; latency histograms can follow if something needs them.
+	 *
+	 * Failure here is not fatal: the target works without statistics.
+	 */
+	{
+		char param[MAX_OBD_NAME * 4];
+
+		scnprintf(param, sizeof(param), "osd-xfs.%s.stats", name);
+		osd->od_stats = ldebugfs_stats_alloc(LPROC_OSD_XFS_LAST, param,
+					osd->od_dt_dev.dd_debugfs_entry, 0);
+		if (osd->od_stats != NULL) {
+			lprocfs_counter_init(osd->od_stats,
+				LPROC_OSD_XFS_CACHE_ACCESS,
+				LPROCFS_CNTR_AVGMINMAX | LPROCFS_TYPE_PAGES,
+				"cache_access");
+			lprocfs_counter_init(osd->od_stats,
+				LPROC_OSD_XFS_CACHE_HIT,
+				LPROCFS_CNTR_AVGMINMAX | LPROCFS_TYPE_PAGES,
+				"cache_hit");
+			lprocfs_counter_init(osd->od_stats,
+				LPROC_OSD_XFS_CACHE_MISS,
+				LPROCFS_CNTR_AVGMINMAX | LPROCFS_TYPE_PAGES,
+				"cache_miss");
+		} else {
+			CWARN("%s: no statistics\n", name);
+		}
+	}
+
+	/*
 	 * qsd_init() registers the quota slave's parameters under a
 	 * proc_dir_entry, so one has to exist even though everything else this
 	 * backend exposes is in debugfs. Without it the quota slave works but
@@ -542,6 +697,11 @@ int osd_procfs_init(struct osd_device *osd, const char *name)
 
 void osd_procfs_fini(struct osd_device *osd)
 {
+	if (osd->od_stats != NULL) {
+		lprocfs_stats_free(&osd->od_stats);
+		osd->od_stats = NULL;
+	}
+
 	if (osd->od_proc_entry != NULL) {
 		lprocfs_remove(&osd->od_proc_entry);
 		osd->od_proc_entry = NULL;

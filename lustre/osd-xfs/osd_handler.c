@@ -169,6 +169,20 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 
 	o->od_root_dentry = osd_sb(o)->s_root;
 
+	/*
+	 * Flash-backed targets get nothing from the page cache; osd-ldiskfs
+	 * makes the same call. The same answer is kept for os_state, where
+	 * OS_STATFS_NONROT tells the MDT it may prefer this target.
+	 */
+	o->od_nonrotational = !blk_queue_rot(bdev_get_queue(osd_sb(o)->s_bdev));
+	if (o->od_nonrotational) {
+		o->od_writethrough_cache = 0;
+		o->od_read_cache = 0;
+	} else {
+		o->od_writethrough_cache = 1;
+		o->od_read_cache = 1;
+	}
+
 	LCONSOLE_INFO("%s: mounted %s as an " OSD_XFS_NAME " target\n",
 		      name, dev);
 	GOTO(out, rc = 0);
@@ -232,10 +246,15 @@ static int osd_statfs(const struct lu_env *env, struct dt_device *d,
 	 * compares them against osc.*.statfs_state: an unset os_state read
 	 * back as "DN", degraded plus nocreate, which claims the target is
 	 * both rebuilding and refusing objects.
+	 *
+	 * NONROT lets the MDT prefer flash targets when allocating, so it is
+	 * a scheduling input rather than cosmetic.
 	 */
 	osfs->os_state = 0;
 	if (unlikely(sb->s_flags & SB_RDONLY))
 		osfs->os_state |= OS_STATFS_READONLY;
+	if (osd->od_nonrotational)
+		osfs->os_state |= OS_STATFS_NONROT;
 
 	/*
 	 * The largest single object this target can hold. Without it the
@@ -1059,7 +1078,9 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	 * and carries the "-osd" suffix, so the tunables appeared as
 	 * osd-xfs.lustre-OST0000-osd.* where osd-ldiskfs publishes
 	 * osd-ldiskfs.lustre-OST0001.*. Anything addressing an OSD by its
-	 * service name then missed.
+	 * service name then misses: sanity 56c writes
+	 * osd-*.$ost_name.nonrotational and got ENOENT, so the target never
+	 * reported the flash flag the test then requires.
 	 */
 	rc = osd_procfs_init(o, o->od_svname);
 	if (rc != 0)

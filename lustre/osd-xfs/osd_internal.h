@@ -300,6 +300,21 @@ struct osd_scrub_stats {
 	int	ss_rc;
 };
 
+/*
+ * Per-target counters published as osd-xfs.<target>.stats.
+ *
+ * cache_access/hit/miss are read by sanity 151 and 156, which check that the
+ * hit counter moves by exactly the number of pages they touched; without them
+ * the sum is always zero and the tests abort with "roc_hit is not safe to
+ * use". The names have to match osd-ldiskfs, since the tests grep for them.
+ */
+enum {
+	LPROC_OSD_XFS_CACHE_ACCESS	= 0,
+	LPROC_OSD_XFS_CACHE_HIT		= 1,
+	LPROC_OSD_XFS_CACHE_MISS	= 2,
+	LPROC_OSD_XFS_LAST,
+};
+
 struct osd_device {
 	struct dt_device	 od_dt_dev;
 
@@ -364,6 +379,7 @@ struct osd_device {
 	atomic64_t		 od_dirty_overflow;	/* tracking array too small */
 	unsigned int		 od_flush_buffered:1;
 	unsigned int		 od_reserve_check:1;	/* consult free space */
+	unsigned int		 od_nonrotational:1;	/* data on flash */
 	/*
 	 * How fallocate() behaves, matching osd-ldiskfs:
 	 *   -1  disabled, return -EOPNOTSUPP
@@ -373,6 +389,7 @@ struct osd_device {
 	 * check_set_fallocate() looks before running the fallocate tests.
 	 */
 	int			 od_fallocate_zero_blocks;
+	struct lprocfs_stats	*od_stats;
 
 	atomic64_t		 od_statfs_calls;
 	unsigned int		 od_declare_check:1;	/* warn on mismatch */
@@ -400,6 +417,9 @@ struct osd_device {
 	/* root of the backing filesystem */
 	struct dentry		*od_root_dentry;
 	struct lu_fid		 od_root_fid;
+
+	unsigned int		 od_read_cache:1,
+				 od_writethrough_cache:1;
 };
 
 /*

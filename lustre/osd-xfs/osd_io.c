@@ -861,6 +861,33 @@ static void osd_bufs_free(struct niobuf_local *lnb, int nr)
 	}
 }
 
+/*
+ * Cache hit accounting for a bulk read.
+ *
+ * The names have to match osd-ldiskfs: sanity 151 and 156 read cache_access
+ * and cache_hit through roc_hit() in the test framework and abort with
+ * "roc_hit is not safe to use" if either is missing. Counted for reads only,
+ * because a write is not a cache access.
+ *
+ * Called with the number of pages in the request and how many of them the
+ * object's address space already held.
+ */
+static void osd_cache_account(struct osd_device *osd, int npages, int hits)
+{
+	if (osd->od_stats == NULL || npages <= 0)
+		return;
+	if (osd->od_read_cache == 0 && osd->od_writethrough_cache == 0)
+		return;
+
+	if (hits != 0)
+		lprocfs_counter_add(osd->od_stats, LPROC_OSD_XFS_CACHE_HIT,
+				    hits);
+	if (npages - hits != 0)
+		lprocfs_counter_add(osd->od_stats, LPROC_OSD_XFS_CACHE_MISS,
+				    npages - hits);
+	lprocfs_counter_add(osd->od_stats, LPROC_OSD_XFS_CACHE_ACCESS, npages);
+}
+
 static int osd_bufs_get(const struct lu_env *env, struct dt_object *dt,
 			loff_t pos, ssize_t len, struct niobuf_local *lnb,
 			int maxlnb, enum dt_bufs_type rw)
@@ -925,10 +952,13 @@ static int osd_bufs_put(const struct lu_env *env, struct dt_object *dt,
  * contiguous pages and issue a single scatter/gather transfer. iov_iter_bvec()
  * and vfs_iter_read/write() are exported, so this needs no kernel change.
  *
- * Writes and reads go through the filesystem page cache. Writes use
- * RWF_DSYNC: generic_write_sync() invokes XFS fsync, which handles
- * data-device cache flushes even with an external log or when forcing the
- * log is a no-op.
+ * Writes use O_DIRECT for aligned runs when writethrough caching is off,
+ * falling back to buffered I/O when necessary. Both paths use RWF_DSYNC:
+ * generic_write_sync() invokes XFS fsync, which handles data-device cache
+ * flushes even with an external log or when forcing the log is a no-op.
+ * Direct I/O by itself provides no such durability guarantee.
+ *
+ * Reads use the filesystem page cache unless both cache switches are off.
  */
 
 /* how many contiguous lnbs start at @i */
@@ -949,11 +979,18 @@ static int osd_bulk_run(struct niobuf_local *lnb, int npages, int i,
 	return n;
 }
 
+static bool osd_bulk_aligned(struct osd_object *obj, loff_t off, size_t len)
+{
+	unsigned int bs = i_blocksize(obj->oo_inode);
+
+	return IS_ALIGNED(off, bs) && IS_ALIGNED(len, bs);
+}
+
 static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 			     struct niobuf_local *lnb, int npages, bool write)
 {
 	struct osd_device *osd = osd_obj2dev(obj);
-	struct file *fbuf = NULL;
+	struct file *fdir = NULL, *fbuf = NULL;
 	struct bio_vec *bvec = NULL;
 	loff_t isize;
 	int i, rc = 0;
@@ -969,6 +1006,39 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 	if (bvec == NULL)
 		RETURN(-ENOMEM);
 
+	/*
+	 * O_DIRECT may be refused by the backing filesystem; that is not fatal,
+	 * it just means every run takes the buffered path.
+	 *
+	 * Writes go direct only when writethrough caching is off. With it on,
+	 * the switch means what it says in osd-ldiskfs: the write goes through
+	 * the page cache and leaves the data there, so a client that writes a
+	 * file and reads it straight back is served from OSS memory instead of
+	 * the platter. Writing with O_DIRECT regardless leaves the object's
+	 * address space empty after a write, every subsequent read misses, and
+	 * sanity 151 and 156 fail with "NOT IN CACHE" on exactly that
+	 * sequence. RWF_DSYNC makes buffered and direct writes durable before
+	 * reporting success.
+	 *
+	 * Reads normally stay buffered on purpose, because the OSS page cache
+	 * and its readahead are worth more than the copy they cost. The
+	 * exception is when both cache switches are off: that is an explicit
+	 * request not to use the page cache at all, and osd-ldiskfs honours it
+	 * by bypassing the cache entirely. Serving such a read from cache
+	 * anyway is what sanity 156 catches on its final case.
+	 */
+	if (write) {
+		if (osd->od_writethrough_cache == 0) {
+			fdir = osd_object_open(obj, O_WRONLY | O_DIRECT);
+			if (IS_ERR(fdir))
+				fdir = NULL;
+		}
+	} else if (osd->od_read_cache == 0 && osd->od_writethrough_cache == 0) {
+		fdir = osd_object_open(obj, O_RDONLY | O_DIRECT);
+		if (IS_ERR(fdir))
+			fdir = NULL;
+	}
+
 	fbuf = osd_object_open(obj, write ? O_WRONLY : O_RDONLY);
 	if (IS_ERR(fbuf)) {
 		rc = PTR_ERR(fbuf);
@@ -980,6 +1050,7 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 
 	for (i = 0; i < npages; ) {
 		struct iov_iter iter;
+		struct file *file;
 		size_t bytes = 0;
 		loff_t pos = lnb[i].lnb_file_offset;
 		int n, j;
@@ -1014,13 +1085,27 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 				      lnb[i + j].lnb_len,
 				      lnb[i + j].lnb_page_offset);
 
+		file = (fdir != NULL && osd_bulk_aligned(obj, pos, bytes)) ?
+			fdir : fbuf;
+
 		iov_iter_bvec(&iter, write ? ITER_SOURCE : ITER_DEST,
 			      bvec, n, bytes);
 
 		if (write)
-			done = vfs_iter_write(fbuf, &iter, &pos, RWF_DSYNC);
+			done = vfs_iter_write(file, &iter, &pos, RWF_DSYNC);
 		else
-			done = vfs_iter_read(fbuf, &iter, &pos, 0);
+			done = vfs_iter_read(file, &iter, &pos, 0);
+
+		if (done == -EINVAL && file == fdir &&
+		    pos == lnb[i].lnb_file_offset &&
+		    iov_iter_count(&iter) == bytes) {
+			/* Retry alignment rejection, never a post-I/O sync error. */
+			pos = lnb[i].lnb_file_offset;
+			iov_iter_bvec(&iter, write ? ITER_SOURCE : ITER_DEST,
+				      bvec, n, bytes);
+			done = write ? vfs_iter_write(fbuf, &iter, &pos, RWF_DSYNC)
+				     : vfs_iter_read(fbuf, &iter, &pos, 0);
+		}
 
 		if (done < 0) {
 			CERROR("%s: bulk %s at %llu+%zu failed: rc = %zd\n",
@@ -1063,6 +1148,8 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 out:
 	if (bvec != NULL)
 		OBD_FREE_PTR_ARRAY_LARGE(bvec, npages);
+	if (fdir != NULL)
+		fput(fdir);
 	if (fbuf != NULL)
 		fput(fbuf);
 	return rc;
@@ -1073,6 +1160,28 @@ static int osd_read_prep(const struct lu_env *env, struct dt_object *dt,
 {
 	struct osd_object *obj = osd_dt_obj(dt);
 
+	/*
+	 * The file layer read: the page cache lookup happens inside
+	 * vfs_iter_read() and leaves nothing per-page to inspect afterwards,
+	 * so ask the mapping first. Same question, one step earlier.
+	 */
+	if (obj->oo_inode != NULL) {
+		int hits = 0, i;
+
+		for (i = 0; i < npages; i++) {
+			struct folio *f;
+
+			f = filemap_get_folio(obj->oo_inode->i_mapping,
+					      lnb[i].lnb_file_offset >>
+					      PAGE_SHIFT);
+			if (IS_ERR_OR_NULL(f))
+				continue;
+			if (folio_test_uptodate(f))
+				hits++;
+			folio_put(f);
+		}
+		osd_cache_account(osd_obj2dev(obj), npages, hits);
+	}
 	return osd_bulk_transfer(env, obj, lnb, npages, false);
 }
 
@@ -1204,9 +1313,10 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 	osd_exec_op(env, handle, OSD_OT_WRITE, 0, 0);
 
 	/*
-	 * Track before attempting I/O: a short write or data-sync error can
-	 * leave dirty pages even when the transfer fails. This must not
-	 * depend on whole-request success.
+	 * Track before attempting I/O: an unaligned direct run can fall back
+	 * to buffered, and a short write or data-sync error can leave dirty
+	 * pages even when the transfer fails. This must not depend on the
+	 * writethrough cache switch or whole-request success.
 	 */
 	if (npages > 0)
 		osd_trans_note_dirty(handle, obj->oo_inode);
