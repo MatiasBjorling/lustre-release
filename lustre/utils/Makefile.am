@@ -150,6 +150,9 @@ endif
 if SERVER
 LIB_TARGETS += mount_osd_wbcfs.so
 endif
+if XFS_ENABLED
+LIB_TARGETS += mount_osd_xfs.so
+endif
 endif # PLUGINS
 
 install-exec-hook:
@@ -260,6 +263,24 @@ else
 PLUGIN_LIB += libmount_utils_wbcfs.a
 endif # PLUGINS
 endif # SERVER
+
+if XFS_ENABLED
+noinst_LIBRARIES += libmount_utils_xfs.a
+
+libmount_utils_xfs_a_SOURCES = libmount_utils_xfs.c
+libmount_utils_xfs_a_CPPFLAGS :=
+
+if PLUGINS
+lib_LTLIBRARIES += libmount_utils_xfs.la
+libmount_utils_xfs.la : libmount_utils_xfs.a
+	$(CC) $(LDFLAGS) $(MNTMODLDFLAGS) -shared -Wl,--export-dynamic \
+			 -o mount_osd_xfs.so \
+			 `$(AR) -t libmount_utils_xfs.a` \
+			 $(MNTMODLIBS)
+else
+PLUGIN_LIB += libmount_utils_xfs.a
+endif # PLUGINS
+endif # XFS_ENABLED
 
 mount_lustre_SOURCES = mount_lustre.c mount_utils.c mount_utils.h $(GSSSRC) \
 			lustre_param.c

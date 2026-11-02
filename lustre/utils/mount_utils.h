@@ -120,6 +120,7 @@ static inline const char *mt_str(enum ldd_mount_type mt)
 		"ldiskfs2",
 		"zfs",
 		"wbcfs",
+		"xfs",
 	};
 
 	return mount_type_string[mt];
@@ -138,6 +139,7 @@ static inline const char *mt_type(enum ldd_mount_type mt)
 		"osd-ldiskfs",
 		"osd-zfs",
 		"osd-wbcfs",
+		"osd-xfs",
 	};
 
 	return mount_type_string[mt];
@@ -229,6 +231,7 @@ struct module_backfs_ops {
 extern struct module_backfs_ops zfs_ops;
 extern struct module_backfs_ops ldiskfs_ops;
 extern struct module_backfs_ops wbcfs_ops;
+extern struct module_backfs_ops xfs_ops;
 
 struct module_backfs_ops *load_backfs_module(enum ldd_mount_type mount_type);
 void unload_backfs_ops(struct module_backfs_ops *ops);

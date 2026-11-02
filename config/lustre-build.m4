@@ -470,6 +470,7 @@ LC_CONFIG_COVERAGE
 AS_IF([test x$enable_modules = xno], [enable_server=no])
 LB_CONFIG_LDISKFS
 LB_CONFIG_ZFS
+LB_CONFIG_XFS
 AS_IF([test "x$enable_modules" = xyes], [
 	LB_KABI_LDISKFS
 	LZ_KABI_ZFS
@@ -478,7 +479,7 @@ AS_IF([test "x$enable_modules" = xyes], [
 
 # If no backends were configured, and the user did not explicitly
 # require servers to be enabled, we just disable servers.
-AS_IF([test x$enable_ldiskfs = xno -a x$enable_zfs = xno], [
+AS_IF([test x$enable_ldiskfs = xno -a x$enable_zfs = xno -a x$enable_xfs = xno], [
 	AS_CASE([$enable_server],
 		[maybe], [enable_server=no],
 		[yes], [AC_MSG_WARN([no backends were configured])])

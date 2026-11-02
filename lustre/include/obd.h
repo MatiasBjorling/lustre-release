@@ -508,6 +508,7 @@ struct tgt_thread_big_cache {
 #define LUSTRE_OSD_LDISKFS_NAME	"osd-ldiskfs"
 #define LUSTRE_OSD_ZFS_NAME	"osd-zfs"
 #define LUSTRE_OSD_WBCFS_NAME	"osd-wbcfs"
+#define LUSTRE_OSD_XFS_NAME	"osd-xfs"
 #define LUSTRE_VVP_NAME		"vvp"
 #define LUSTRE_LMV_NAME		"lmv"
 #define LUSTRE_SLP_NAME		"slp"

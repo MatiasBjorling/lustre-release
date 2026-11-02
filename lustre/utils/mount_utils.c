@@ -605,6 +605,11 @@ struct module_backfs_ops *load_backfs_module(enum ldd_mount_type mount_type)
 	case LDD_MT_WBCFS:
 		ops = &wbcfs_ops;
 		break;
+#ifdef HAVE_XFS_OSD
+	case LDD_MT_XFS:
+		ops = &xfs_ops;
+		break;
+#endif /* HAVE_XFS_OSD */
 	default:
 		ops = NULL;
 		break;

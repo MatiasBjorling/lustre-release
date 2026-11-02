@@ -125,6 +125,7 @@ enum ldd_mount_type {
 	LDD_MT_LDISKFS2 = 4,
 	LDD_MT_ZFS = 5,
 	LDD_MT_WBCFS = 6,
+	LDD_MT_XFS = 7,
 	LDD_MT_LAST
 };
 
