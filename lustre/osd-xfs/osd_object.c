@@ -850,6 +850,15 @@ static int osd_create(const struct lu_env *env, struct dt_object *dt,
 		obj->oo_rec_len = 0;
 	}
 
+	/*
+	 * Crash test hook: each create is committed, nothing after it is.
+	 * Precreate writes LAST_ID before its creates, so this checks that
+	 * the watermark never survives ahead of the objects.
+	 */
+	if (CFS_FAIL_CHECK(OBD_FAIL_OSD_XFS_CREATE_CRASH))
+		panic("%s: crashing after creating "DFID", by request\n",
+		      osd_name(osd), PFID(fid));
+
 	/* The project id is not set at allocation; it is a separate update. */
 	if (attr != NULL && (attr->la_valid & LA_PROJID) &&
 	    attr->la_projid != 0) {

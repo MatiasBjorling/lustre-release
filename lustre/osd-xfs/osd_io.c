@@ -120,6 +120,8 @@ static int osd_rec_small_log(struct osd_object *obj)
 	lockdep_assert_held(&obj->oo_rec_lock);
 	if (!obj->oo_rec_dirty)
 		return 0;
+	if (CFS_FAIL_CHECK(OBD_FAIL_OSD_XFS_LASTID_LOG))
+		return -EIO;
 	inode_lock(obj->oo_inode);
 	rc = __vfs_setxattr(&nop_mnt_idmap, obj->oo_dentry, obj->oo_inode,
 			    OSD_REC_SMALL_XATTR, obj->oo_rec_val,

@@ -781,6 +781,10 @@ extern bool obd_enable_fname_encoding;
 #define OBD_FAIL_OSD_FAIL_AT_TRUNCATE		0x2301
 #define OBD_FAIL_OSD_MARK_COMPRESSED	 	0x2302
 #define OBD_FAIL_OSD_FALLOCATE_ERR		0x2303
+/* osd-xfs crash points: panic at a transaction boundary, or fail a record */
+#define OBD_FAIL_OSD_XFS_TXN_STOP_CRASH		0x2304
+#define OBD_FAIL_OSD_XFS_LASTID_LOG		0x2305
+#define OBD_FAIL_OSD_XFS_CREATE_CRASH		0x2306
 
 /* continuation of MDS related constants */
 #define OBD_FAIL_MDS_PAUSE_CREATE_AFTER_LOOKUP	0x2401

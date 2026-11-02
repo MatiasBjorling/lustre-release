@@ -811,6 +811,9 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 	 * of committed transactions, so a crash cannot keep the watermark and
 	 * lose the objects it covers.
 	 */
+	if (CFS_FAIL_CHECK(OBD_FAIL_OSD_XFS_TXN_STOP_CRASH))
+		panic("%s: crashing at trans_stop before the deferred records, by request\n",
+		      osd_name(osd));
 	rc = osd_rec_defer_flush(env, oh);
 	if (rc)
 		th->th_result = osd_commit_error(osd, rc);
