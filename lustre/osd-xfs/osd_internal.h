@@ -74,6 +74,42 @@
 #define OSD_XFS_SUBDIR_COUNT	32
 
 /*
+ * Commit accumulator batching.
+ *
+ * A purely time-based delay is the wrong shape. At 20 ms it cost 15% of
+ * streaming write throughput and pushed p99 from 58 ms to 198 ms at qd64,
+ * because Lustre clients need commit callbacks to release grant: delaying the
+ * callback throttles the write pipeline even though the data is already on
+ * disk.
+ *
+ * So: a timer to catch a trickle, plus an immediate force once enough
+ * transactions have piled up.
+ *
+ * A write RPC without OBD_BRW_ASYNC sets th_sync, so under a streaming write
+ * almost every transaction is one whose caller is blocked waiting for it.
+ * Those join the batch and wait, so the timer is a latency floor for the RPC
+ * as well as the window the batch accumulates in, and it has a peak rather
+ * than being monotonic.
+ *
+ * Measured on six SMR-class SATA OSTs, 1 MiB sequential writes, six jobs at
+ * queue depth 16:
+ *
+ *	1 ms	533 MiB/s	3.19 transactions per force
+ *	4 ms	534 MiB/s	3.23
+ *	10 ms	540 MiB/s	3.95
+ *	25 ms	560 MiB/s	5.98
+ *	50 ms	548 MiB/s	8.60
+ *	100 ms	476 MiB/s	13.01
+ *	150 ms	407 MiB/s	15.71
+ *
+ * Past 25 ms the added RPC latency costs more than the larger batch saves.
+ * Tunable per target through commit_delay_ms, because the peak depends on
+ * the device and the workload.
+ */
+#define OSD_COMMIT_DELAY_MS	25
+#define OSD_COMMIT_BATCH_MAX	32
+
+/*
  * Declared cost of each operation, in filesystem blocks and new inodes.
  *
  * These are deliberate over-estimates. The declare phase exists so a
@@ -256,11 +292,37 @@ struct osd_device {
 	atomic_t		 od_connects;
 	struct lu_site		 od_site;
 
+	/* Publication-ordered callback queue, completed after snapshot barriers. */
 	/* Sticky durability errors serialize with successful commit callbacks. */
 	struct mutex		 od_durability_lock;
-	/* Hook outcome precedes successful callback visibility. */
+	/* Hook outcome and enrollment precede successful callback visibility. */
 	struct mutex		 od_publish_lock;
 	int			 od_durability_error;
+	struct list_head	 od_commit_list;	/* osd_thandle, seq order */
+	spinlock_t		 od_commit_lock;
+	struct delayed_work	 od_commit_work;
+	struct workqueue_struct	*od_commit_wq;
+	u64			 od_commit_seq;	/* last assigned publication */
+	u64			 od_commit_seq_done;	/* contiguous durable floor */
+	u64			 od_commit_seq_failed;
+	int			 od_commit_seq_error;
+	atomic_t		 od_commit_pending;
+	unsigned int		 od_commit_stopping:1;
+	/*
+	 * Defer commit callbacks and batch the log forces behind them, the
+	 * same shape as jbd2's batched commits. See OSD_COMMIT_DELAY_MS for
+	 * what it is worth on SMR. Switchable so that can be retested.
+	 */
+	unsigned int		 od_commit_defer:1;
+
+	/*
+	 * How long the commit worker waits before forcing, milliseconds.
+	 * Tunable because the useful value depends on the device: a longer
+	 * wait batches more transactions into one log force at the cost of
+	 * delaying the commit callbacks, and therefore how quickly a client
+	 * learns its writes are committed.
+	 */
+	unsigned int		 od_commit_delay_ms;
 
 	/* Advisory admission accounting, not an XFS allocation reservation. */
 	struct mutex		 od_res_lock;
@@ -278,6 +340,9 @@ struct osd_device {
 	atomic64_t		 od_statfs_calls;
 	unsigned int		 od_declare_check:1;	/* warn on mismatch */
 
+	/* how many transactions each log force covered, for lprocfs */
+	atomic64_t		 od_commit_forces;
+	atomic64_t		 od_commit_batched;
 	/* FID -> object mapping: the O/ directory tree, for OST data objects */
 	struct osd_obj_map	*od_ost_map;
 	/* FID -> object mapping for everything else */
@@ -294,6 +359,22 @@ struct osd_device {
  */
 struct osd_thandle {
 	struct thandle		 ot_super;
+	/* OSD publication order, not an XFS CIL sequence. */
+	u64			 ot_commit_seq;
+	/* linkage on osd_device.od_commit_list */
+	struct list_head	 ot_commit_link;
+
+	/*
+	 * Set when trans_stop's caller wants this transaction durable before
+	 * it returns, rather than letting the worker complete it later. The
+	 * worker does the same work either way; with this set it signals the
+	 * completion instead of freeing the handle, and the waiter takes
+	 * ot_commit_rc and frees. That lets a th_sync transaction share one
+	 * writeback and one log force with everything else in the batch
+	 * instead of doing its own.
+	 */
+	struct completion	*ot_commit_done;
+	int			 ot_commit_rc;
 	int			 ot_res_error;
 
 	/*
@@ -484,6 +565,8 @@ void osd_trans_drop_dirty(struct osd_thandle *oh);
 bool osd_trans_writeback_dirty(const struct lu_env *env,
 			       struct osd_device *osd,
 			       struct osd_thandle *oh, int *rcp);
+bool osd_commit_writeback_batch(struct osd_device *osd,
+				struct list_head *batch, int *rcp);
 const char *osd_op_name(enum osd_op_type op);
 
 int  osd_oi_lookup(const struct lu_env *env, struct osd_device *dev,

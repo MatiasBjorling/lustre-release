@@ -727,8 +727,8 @@ static ssize_t osd_write(const struct lu_env *env, struct dt_object *dt,
 	 * write to the same block on the platter per RPC, which on a
 	 * rotating device is a seek out of the sequential data stream and
 	 * back. The transaction's commit path writes the file back instead,
-	 * before the callbacks that report the transaction durable, so the
-	 * durability boundary is unchanged.
+	 * once per batch, before the callbacks that report those
+	 * transactions durable, so the durability boundary is unchanged.
 	 *
 	 * Without a transaction there is nothing to carry the sync, so the
 	 * write has to be durable when it returns.

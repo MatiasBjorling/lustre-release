@@ -364,6 +364,7 @@ static struct thandle *osd_trans_create(const struct lu_env *env,
 	th->th_result = 0;
 	INIT_LIST_HEAD(&oh->ot_commit_dcb_list);
 	INIT_LIST_HEAD(&oh->ot_stop_dcb_list);
+	INIT_LIST_HEAD(&oh->ot_commit_link);
 
 	RETURN(th);
 }
@@ -458,8 +459,9 @@ static int osd_trans_stop_cb_run(const struct lu_env *env,
 	return result;
 }
 /*
- * Hook outcome and callback delivery share od_publish_lock, so every
- * transaction completes in the order it published, including errors.
+ * Publication assignment, hook outcome and queue enrollment share this lock.
+ * Every published handle completes in assignment order, including errors and
+ * callers that disable deferral. Never wait for the worker under this lock.
  * Always nest od_durability_lock inside od_publish_lock, never the reverse.
  */
 static int osd_trans_complete(const struct lu_env *env, struct osd_device *osd,
@@ -469,9 +471,177 @@ static int osd_trans_complete(const struct lu_env *env, struct osd_device *osd,
 	mutex_lock(&osd->od_durability_lock);
 	if (osd->od_durability_error != 0)
 		error = osd->od_durability_error;
+	if (oh->ot_commit_seq != 0) {
+		if (error != 0 && osd->od_commit_seq_failed == 0) {
+			osd->od_commit_seq_failed = oh->ot_commit_seq;
+			osd->od_commit_seq_error = error;
+			CERROR("%s: publication %llu failed: rc = %d; unmount/recovery/replay required\n",
+			       osd_name(osd), oh->ot_commit_seq, error);
+		}
+		if (error == 0) {
+			LASSERT(osd->od_commit_seq_failed == 0);
+			LASSERT(oh->ot_commit_seq == osd->od_commit_seq_done + 1);
+			osd->od_commit_seq_done = oh->ot_commit_seq;
+		}
+	}
 	osd_trans_commit_cb_run(oh, error);
 	mutex_unlock(&osd->od_durability_lock);
 	return error;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* commit accumulator                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Complete the parked transactions after writing back their tracked inodes
+ * and forcing the log. Runs from a workqueue so callers do not wait here.
+ */
+static void osd_commit_worker(struct work_struct *work)
+{
+	struct osd_device *osd = container_of(to_delayed_work(work),
+					      struct osd_device,
+					      od_commit_work);
+	struct osd_thandle *oh, *tmp;
+	LIST_HEAD(done);
+	int batched = 0;
+	int rc = 0, rc2;
+
+	/*
+	 * Snapshot the publication-ordered queue before the durability barrier.
+	 * The OSD sequence orders callbacks; it is not an XFS CIL sequence or a
+	 * claim of metadata atomicity. Arrivals during the barrier stay parked
+	 * for the next round, and cannot bypass this snapshot to complete inline.
+	 */
+	spin_lock(&osd->od_commit_lock);
+	if (list_empty(&osd->od_commit_list)) {
+		spin_unlock(&osd->od_commit_lock);
+		return;
+	}
+	list_splice_init(&osd->od_commit_list, &done);
+	spin_unlock(&osd->od_commit_lock);
+
+	/*
+	 * Finish any outstanding writeback before forcing metadata. Successful
+	 * record and bulk writes already requested filesystem data-sync
+	 * completion; the log force alone is not a data durability barrier.
+	 *
+	 * Done for the batch as a whole so a file every transaction dirties,
+	 * last_rcvd above all, is written back once per force instead of once
+	 * per transaction.
+	 */
+	rc = osd_commit_error(osd, 0);
+	if (rc == 0) {
+		osd_commit_writeback_batch(osd, &done, &rc);
+		rc = osd_commit_error(osd, rc);
+	}
+
+	rc2 = osd_force_log(osd);
+	if (rc == 0)
+		rc = rc2;
+
+	list_for_each_entry(oh, &done, ot_commit_link)
+		batched++;
+
+	atomic64_inc(&osd->od_commit_forces);
+	atomic64_add(batched, &osd->od_commit_batched);
+
+	list_for_each_entry_safe(oh, tmp, &done, ot_commit_link) {
+		struct completion *waiter = oh->ot_commit_done;
+
+		list_del_init(&oh->ot_commit_link);
+		osd_trans_drop_dirty(oh);
+		osd_reserve_release(osd, oh);
+		mutex_lock(&osd->od_publish_lock);
+		oh->ot_commit_rc = osd_trans_complete(NULL, osd, oh,
+						    oh->ot_commit_rc ?: rc);
+		atomic_dec(&osd->od_commit_pending);
+		if (waiter != NULL) {
+			/*
+			 * The caller owns oh after this signal. All callbacks and
+			 * handle accesses must finish before waking its stack waiter.
+			 */
+			complete(waiter);
+		} else {
+			OBD_FREE_PTR(oh);
+		}
+		mutex_unlock(&osd->od_publish_lock);
+	}
+
+	/*
+	 * Anything that arrived while we were forcing. Re-arm with the delay,
+	 * not immediately.
+	 *
+	 * Re-arming with 0 was a self-defeating loop: the worker forced, found
+	 * the few transactions that had arrived during the force, forced
+	 * again, and so on. Under a streaming write it managed 2,131 forces in
+	 * 20 seconds batching 2.85 transactions each -- effectively the
+	 * synchronous behaviour it was meant to replace, plus a worker thread
+	 * and a lock. Waiting lets the queue actually build.
+	 */
+	spin_lock(&osd->od_commit_lock);
+	if (!list_empty(&osd->od_commit_list) && !osd->od_commit_stopping)
+		queue_delayed_work(osd->od_commit_wq, &osd->od_commit_work,
+				   msecs_to_jiffies(osd->od_commit_delay_ms));
+	spin_unlock(&osd->od_commit_lock);
+}
+
+/*
+ * Enroll every publication, including failed and non-deferred transactions.
+ * The latter wait for this same ordered worker instead of bypassing its queue.
+ */
+static bool osd_commit_defer(struct osd_device *osd, struct osd_thandle *oh)
+{
+	int pending;
+
+	lockdep_assert_held(&osd->od_publish_lock);
+	if (osd->od_commit_wq == NULL || osd->od_commit_stopping)
+		return false;
+
+	spin_lock(&osd->od_commit_lock);
+	if (osd->od_commit_stopping) {
+		spin_unlock(&osd->od_commit_lock);
+		return false;
+	}
+	list_add_tail(&oh->ot_commit_link, &osd->od_commit_list);
+	pending = atomic_inc_return(&osd->od_commit_pending);
+	spin_unlock(&osd->od_commit_lock);
+
+	/*
+	 * Enough work has piled up that a force now will batch well: go
+	 * immediately rather than making everyone wait out the timer. Under
+	 * load this is the path that always fires, so the delay never appears
+	 * in a client's latency.
+	 */
+	if (!osd->od_commit_defer || oh->ot_commit_rc != 0 ||
+	    pending >= OSD_COMMIT_BATCH_MAX)
+		mod_delayed_work(osd->od_commit_wq, &osd->od_commit_work, 0);
+	else
+		queue_delayed_work(osd->od_commit_wq, &osd->od_commit_work,
+				   msecs_to_jiffies(osd->od_commit_delay_ms));
+	return true;
+}
+
+/* drain everything, used at unmount */
+static void osd_commit_flush(struct osd_device *osd)
+{
+	int waited = 0;
+
+	if (osd->od_commit_wq == NULL)
+		return;
+
+	while (atomic_read(&osd->od_commit_pending) > 0 && waited < 600) {
+		mod_delayed_work(osd->od_commit_wq, &osd->od_commit_work, 0);
+		flush_delayed_work(&osd->od_commit_work);
+		if (atomic_read(&osd->od_commit_pending) == 0)
+			break;
+		schedule_timeout_uninterruptible(HZ / 10);
+		waited++;
+	}
+	if (atomic_read(&osd->od_commit_pending) > 0)
+		CERROR("%s: %d transactions still uncommitted at unmount\n",
+		       osd_name(osd), atomic_read(&osd->od_commit_pending));
 }
 
 static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
@@ -501,12 +671,21 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 		th->th_result = osd_commit_error(osd, rc);
 
 	mutex_lock(&osd->od_publish_lock);
+	/* Shutdown may have disabled enrollment with an older batch in flight. */
+	while (mutated && osd->od_commit_stopping &&
+	       atomic_read(&osd->od_commit_pending) != 0) {
+		mutex_unlock(&osd->od_publish_lock);
+		osd_commit_flush(osd);
+		mutex_lock(&osd->od_publish_lock);
+	}
 	/*
 	 * No execution means no recovery publication, even after a successful
 	 * start. In particular, advisory admission failure must not write
 	 * last_rcvd or poison the target. Executed VFS operations may have
 	 * partially mutated state: an error there remains conservatively fatal.
 	 */
+	if (mutated)
+		oh->ot_commit_seq = ++osd->od_commit_seq;
 	rc = osd_commit_error(osd, 0);
 	if (rc == 0 && th->th_result != 0 && mutated)
 		rc = osd_commit_error(osd, th->th_result);
@@ -523,7 +702,29 @@ static int osd_trans_stop(const struct lu_env *env, struct dt_device *dt,
 		rc = th->th_result;
 	rc = osd_trans_stop_cb_run(env, oh, rc);
 
-	if (rc == 0 && mutated) {
+	if (oh->ot_commit_seq != 0) {
+		DECLARE_COMPLETION_ONSTACK(done);
+		/* The hook can set th_sync; errors and disabled deferral also wait. */
+		const bool sync = th->th_sync || rc != 0 || !osd->od_commit_defer;
+
+		oh->ot_commit_rc = rc;
+		if (sync)
+			oh->ot_commit_done = &done;
+		if (osd_commit_defer(osd, oh)) {
+			/* Do not touch an asynchronous handle after enrollment. */
+			mutex_unlock(&osd->od_publish_lock);
+			if (!sync)
+				RETURN(osd_commit_error(osd, 0));
+			wait_for_completion(&done);
+			rc = oh->ot_commit_rc;
+			OBD_FREE_PTR(oh);
+			RETURN(rc);
+		}
+		oh->ot_commit_done = NULL;
+	}
+
+	/* No worker, or a drained shutdown: publication remains serialized. */
+	if (rc == 0 && oh->ot_commit_seq != 0) {
 		int rc2;
 
 		osd_trans_writeback_dirty(env, osd, oh, &rc);
@@ -560,6 +761,12 @@ static int osd_sync(const struct lu_env *env, struct dt_device *d)
 	struct osd_device *osd = osd_dt_dev(d);
 
 	CDEBUG(D_CACHE, "%s: syncing OSD\n", osd_name(osd));
+	/*
+	 * Deferred transactions must be completed here, not merely made
+	 * durable: a caller of dt_sync() is entitled to assume every commit
+	 * callback for work it has already done has run.
+	 */
+	osd_commit_flush(osd);
 	return osd_force_log(osd);
 }
 
@@ -568,7 +775,7 @@ static int osd_commit_async(const struct lu_env *env, struct dt_device *d)
 	struct osd_device *osd = osd_dt_dev(d);
 	struct super_block *sb = osd_sb(osd);
 
-	/* Ask for a non-blocking log push. */
+	/* Ask for a non-blocking log push; the commit worker forces it anyway. */
 	if (sb != NULL && sb->s_op != NULL && sb->s_op->sync_fs != NULL &&
 	    !sb_rdonly(sb))
 		return osd_commit_error(osd, sb->s_op->sync_fs(sb, 0));
@@ -741,7 +948,20 @@ static int osd_device_init0(const struct lu_env *env, struct osd_device *o,
 	if (rc != 0)
 		GOTO(out_map, rc);
 
+	INIT_LIST_HEAD(&o->od_commit_list);
+	spin_lock_init(&o->od_commit_lock);
+	INIT_DELAYED_WORK(&o->od_commit_work, osd_commit_worker);
+	atomic_set(&o->od_commit_pending, 0);
+	atomic64_set(&o->od_commit_forces, 0);
+	atomic64_set(&o->od_commit_batched, 0);
+	o->od_commit_defer = 1;
+	o->od_commit_delay_ms = OSD_COMMIT_DELAY_MS;
 	osd_reserve_init(o);
+	o->od_commit_wq = alloc_workqueue("osd_xfs_commit",
+					  WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+	if (o->od_commit_wq == NULL)
+		CWARN("%s: no commit workqueue, forcing the log per transaction\n",
+		      osd_name(o));
 
 	/*
 	 * Register under od_svname, not name. `name` is the OSD device name
@@ -829,6 +1049,17 @@ static struct lu_device *osd_device_fini(const struct lu_env *env,
 
 	ENTRY;
 
+	if (o->od_commit_wq != NULL) {
+		mutex_lock(&o->od_publish_lock);
+		spin_lock(&o->od_commit_lock);
+		o->od_commit_stopping = 1;
+		spin_unlock(&o->od_commit_lock);
+		mutex_unlock(&o->od_publish_lock);
+		osd_commit_flush(o);
+		cancel_delayed_work_sync(&o->od_commit_work);
+		destroy_workqueue(o->od_commit_wq);
+		o->od_commit_wq = NULL;
+	}
 	osd_procfs_fini(o);
 	osd_oi_fini(o);
 	osd_obj_map_fini(o);
@@ -1086,10 +1317,14 @@ static int osd_health_check(const struct lu_env *env, struct obd_device *obd)
 	struct super_block *sb = osd_sb(osd);
 	int error;
 
+	mutex_lock(&osd->od_publish_lock);
 	error = osd_commit_error(osd, 0);
 	if (error != 0)
-		CERROR("%s: unhealthy: fence_rc=%d; unmount/recovery/replay required\n",
-		       osd_name(osd), error);
+		CERROR("%s: unhealthy: publication=%llu durable=%llu failed=%llu failed_rc=%d fence_rc=%d; unmount/recovery/replay required\n",
+		       osd_name(osd), osd->od_commit_seq,
+		       osd->od_commit_seq_done, osd->od_commit_seq_failed,
+		       osd->od_commit_seq_error, error);
+	mutex_unlock(&osd->od_publish_lock);
 	return sb == NULL || sb_rdonly(sb) || error != 0;
 }
 

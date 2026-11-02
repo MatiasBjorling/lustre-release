@@ -47,6 +47,105 @@ static int osd_fstype_seq_show(struct seq_file *m, void *data)
 LDEBUGFS_SEQ_FOPS_RO(osd_fstype);
 
 /*
+ * Commit accumulator statistics. "batched per force" is the number that says
+ * whether deferring commits is doing anything: 1.0 means every transaction is
+ * still getting its own log force, which is what this replaced.
+ */
+static int osd_commit_stats_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	u64 forces = atomic64_read(&osd->od_commit_forces);
+	u64 batched = atomic64_read(&osd->od_commit_batched);
+
+	seq_printf(m, "log_forces:        %llu\n", forces);
+	seq_printf(m, "transactions:      %llu\n", batched);
+	seq_printf(m, "batched_per_force: %llu.%02llu\n",
+		   forces ? batched / forces : 0,
+		   forces ? (batched * 100 / forces) % 100 : 0);
+	seq_printf(m, "pending:           %d\n",
+		   atomic_read(&osd->od_commit_pending));
+	mutex_lock(&osd->od_publish_lock);
+	seq_printf(m, "seq_published:     %llu\n", osd->od_commit_seq);
+	seq_printf(m, "seq_durable:       %llu\n", osd->od_commit_seq_done);
+	seq_printf(m, "seq_failed:        %llu\n", osd->od_commit_seq_failed);
+	seq_printf(m, "seq_failed_error:  %d\n", osd->od_commit_seq_error);
+	seq_printf(m, "durability_error:  %d\n", osd_commit_error(osd, 0));
+	mutex_unlock(&osd->od_publish_lock);
+	seq_puts(m, "recovery:          unmount/backing-filesystem recovery/Lustre replay; no live reset\n");
+	return 0;
+}
+LDEBUGFS_SEQ_FOPS_RO(osd_commit_stats);
+
+
+/* Whether commit callbacks are deferred and their log forces batched. */
+static int osd_commit_defer_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+
+	seq_printf(m, "%u\n", osd->od_commit_defer);
+	return 0;
+}
+
+static ssize_t osd_commit_defer_seq_write(struct file *file,
+					  const char __user *buffer,
+					  size_t count, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	bool val;
+	int rc;
+
+	rc = kstrtobool_from_user(buffer, count, &val);
+	if (rc)
+		return rc;
+	if (val && osd->od_commit_wq == NULL)
+		return -EOPNOTSUPP;
+	mutex_lock(&osd->od_publish_lock);
+	if (atomic_read(&osd->od_commit_pending)) {
+		mutex_unlock(&osd->od_publish_lock);
+		return -EBUSY;
+	}
+	osd->od_commit_defer = val;
+	mutex_unlock(&osd->od_publish_lock);
+
+	return count;
+}
+LDEBUGFS_SEQ_FOPS(osd_commit_defer);
+
+/*
+ * How long the commit worker waits before forcing the log, milliseconds.
+ * Zero forces as soon as the worker is scheduled.
+ */
+static int osd_commit_delay_ms_seq_show(struct seq_file *m, void *data)
+{
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+
+	seq_printf(m, "%u\n", osd->od_commit_delay_ms);
+	return 0;
+}
+
+static ssize_t osd_commit_delay_ms_seq_write(struct file *file,
+					     const char __user *buffer,
+					     size_t count, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct osd_device *osd = osd_dt_dev((struct dt_device *)m->private);
+	unsigned int val;
+	int rc;
+
+	rc = kstrtouint_from_user(buffer, count, 0, &val);
+	if (rc)
+		return rc;
+	if (val > 1000)
+		return -ERANGE;
+	osd->od_commit_delay_ms = val;
+
+	return count;
+}
+LDEBUGFS_SEQ_FOPS(osd_commit_delay_ms);
+
+
+/*
  * The declare phase and its reservation.
  *
  * "denied" counts transactions refused at trans_start for want of space, which
@@ -254,6 +353,12 @@ static struct ldebugfs_vars ldebugfs_osd_obd_vars[] = {
 	  .fops = &osd_mount_options_fops },
 	{ .name = "fstype",
 	  .fops = &osd_fstype_fops },
+	{ .name = "commit_stats",
+	  .fops = &osd_commit_stats_fops },
+	{ .name = "commit_defer",
+	  .fops = &osd_commit_defer_fops },
+	{ .name = "commit_delay_ms",
+	  .fops = &osd_commit_delay_ms_fops },
 	{ .name = "reserve",
 	  .fops = &osd_reserve_fops },
 	{ .name = "flush_buffered",

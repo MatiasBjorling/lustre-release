@@ -330,9 +330,10 @@ void osd_trans_drop_dirty(struct osd_thandle *oh)
 /*
  * Write this transaction's buffered pages out to the device.
  *
- * Deliberately does NOT issue a device cache flush: the caller forces the
- * log afterwards, which flushes the device cache. Returns true if anything
- * was written and a flush is therefore owed.
+ * Deliberately does NOT issue a device cache flush: the caller does that once,
+ * because a cache flush is the expensive part and a batch of transactions
+ * needs only one of them. Returns true if anything was written and a flush is
+ * therefore owed.
  */
 bool osd_trans_writeback_dirty(const struct lu_env *env,
 			       struct osd_device *osd,
@@ -389,6 +390,118 @@ bool osd_trans_writeback_dirty(const struct lu_env *env,
 	}
 	oh->ot_ndirty = 0;
 	oh->ot_dirty_overflow = 0;
+
+	if (rcp != NULL && rc != 0 && *rcp == 0)
+		*rcp = rc;
+
+	return written;
+}
+
+/*
+ * Write back the inodes tracked by a whole batch of transactions, flushing
+ * each distinct inode once.
+ *
+ * Every write transaction dirties last_rcvd, so flushing per transaction
+ * issues one 4 KiB write to the same block per RPC. On a rotating device
+ * that is a seek away from the sequential data stream and back, measured at
+ * a fifth of all requests reaching the drive. Deduplicating across the batch
+ * turns those N writes into one.
+ *
+ * Durability is unchanged: every inode any transaction in the batch dirtied
+ * is written and waited for before this returns, and the caller runs it
+ * before the commit callbacks that report those transactions durable.
+ */
+bool osd_commit_writeback_batch(struct osd_device *osd,
+				struct list_head *batch, int *rcp)
+{
+	struct osd_thandle *oh;
+	bool written = false;
+	bool overflow = false;
+	int rc = 0;
+
+	if (!osd->od_flush_buffered) {
+		list_for_each_entry(oh, batch, ot_commit_link)
+			osd_trans_drop_dirty(oh);
+		return false;
+	}
+
+	list_for_each_entry(oh, batch, ot_commit_link) {
+		if (oh->ot_ndirty > 0 || oh->ot_dirty_overflow)
+			atomic64_inc(&osd->od_dirty_txn);
+		if (unlikely(oh->ot_dirty_overflow))
+			overflow = true;
+	}
+
+	if (unlikely(overflow)) {
+		struct super_block *sb = osd_sb(osd);
+
+		/*
+		 * A transaction tracked more buffered writes than its array
+		 * holds, so its list is incomplete and flushing only what is
+		 * in it would miss some. One filesystem-wide sync covers
+		 * every inode in the batch, so nothing else is needed.
+		 */
+		atomic64_inc(&osd->od_dirty_overflow);
+		CWARN("%s: more than %d buffered writes in one transaction, flushing the whole filesystem\n",
+		      osd_name(osd), OSD_TH_MAX_DIRTY);
+		if (sb != NULL)
+			rc = sync_filesystem(sb);
+		list_for_each_entry(oh, batch, ot_commit_link)
+			osd_trans_drop_dirty(oh);
+		if (rcp != NULL && rc != 0 && *rcp == 0)
+			*rcp = rc;
+		return true;
+	}
+
+	list_for_each_entry(oh, batch, ot_commit_link) {
+		int i;
+
+		for (i = 0; i < oh->ot_ndirty; i++) {
+			struct inode *inode = oh->ot_dirty[i];
+			struct osd_thandle *prev;
+			bool seen = false;
+			int rc2;
+
+			if (inode == NULL)
+				continue;
+
+			/*
+			 * Flushed already by an earlier transaction in this
+			 * batch? The batch is a handful of transactions and
+			 * each tracks one or two inodes, so the scan is
+			 * cheaper than the allocation a set would need.
+			 */
+			list_for_each_entry(prev, batch, ot_commit_link) {
+				int j;
+
+				if (prev == oh)
+					break;
+				for (j = 0; j < prev->ot_ndirty; j++) {
+					if (prev->ot_dirty[j] == inode) {
+						seen = true;
+						break;
+					}
+				}
+				if (seen)
+					break;
+			}
+			if (seen)
+				continue;
+
+			rc2 = filemap_write_and_wait(inode->i_mapping);
+			atomic64_inc(&osd->od_dirty_flushed);
+			written = true;
+			if (rc2 != 0 && rc == 0)
+				rc = rc2;
+		}
+	}
+
+	/*
+	 * Drop the references only after every flush, because the scan above
+	 * compares against inodes still held by earlier transactions.
+	 */
+	list_for_each_entry(oh, batch, ot_commit_link)
+		osd_trans_drop_dirty(oh);
 
 	if (rcp != NULL && rc != 0 && *rcp == 0)
 		*rcp = rc;
