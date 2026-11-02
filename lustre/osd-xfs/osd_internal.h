@@ -364,6 +364,15 @@ struct osd_device {
 	atomic64_t		 od_dirty_overflow;	/* tracking array too small */
 	unsigned int		 od_flush_buffered:1;
 	unsigned int		 od_reserve_check:1;	/* consult free space */
+	/*
+	 * How fallocate() behaves, matching osd-ldiskfs:
+	 *   -1  disabled, return -EOPNOTSUPP
+	 *    0  allocate unwritten extents
+	 *    1  zero the allocated extents on disk
+	 * Exposed as osd-xfs.<target>.fallocate_zero_blocks, which is where
+	 * check_set_fallocate() looks before running the fallocate tests.
+	 */
+	int			 od_fallocate_zero_blocks;
 
 	atomic64_t		 od_statfs_calls;
 	unsigned int		 od_declare_check:1;	/* warn on mismatch */

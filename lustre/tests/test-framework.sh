@@ -12676,7 +12676,11 @@ function check_fallocate_supported()
 		return 1
 	fi
 
-	if [[ "$op" == "alloc" && "${!fstype}" != "ldiskfs" ]]; then
+	# osd-xfs allocates real extents for fallocate, same as ldiskfs, so it
+	# consumes space and belongs on this path. zfs does not, which is why
+	# it only has punch.
+	if [[ "$op" == "alloc" && "${!fstype}" != "ldiskfs" &&
+	      "${!fstype}" != "xfs" ]]; then
 		echo "fallocate on ${!fstype} doesn't consume space" 1>&2
 		return 1
 	fi
@@ -12728,6 +12732,7 @@ function check_set_fallocate()
 	local new_mode="$1"
 	local fa_mode_ldiskfs="osd-ldiskfs.*.fallocate_zero_blocks"
 	local fa_mode_zfs="osd-zfs.*.fallocate_zero_blocks"
+	local fa_mode_xfs="osd-xfs.*.fallocate_zero_blocks"
 	local op=alloc
 	local old_mode
 	local fa_mode
@@ -12735,6 +12740,8 @@ function check_set_fallocate()
 	if [[ "$ost1_FSTYPE" = "zfs" || "$mds1_FSTYPE" = "zfs" ]]; then
 		fa_mode=$fa_mode_zfs
 		op=punch # zfs only have punch for now.
+	elif [[ "$ost1_FSTYPE" = "xfs" ]]; then
+		fa_mode=$fa_mode_xfs
 	else
 		fa_mode=$fa_mode_ldiskfs
 	fi

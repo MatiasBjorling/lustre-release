@@ -334,7 +334,60 @@ static ssize_t osd_reserve_check_seq_write(struct file *file,
 }
 LDEBUGFS_SEQ_FOPS(osd_reserve_check);
 
+/*
+ * osd-*.<target>.fallocate_zero_blocks.
+ *
+ * check_set_fallocate() in the test framework reads this before any
+ * fallocate test and skips the whole group when it is absent, which is why
+ * sanity 101m, 127f and eleven 150* cases skipped on osd-xfs while passing
+ * on ldiskfs. osd-xfs does implement fallocate, so the parameter belongs
+ * here.
+ *
+ *   -1  disabled, fallocate returns -EOPNOTSUPP
+ *    0  allocate unwritten extents, which is what XFS does natively
+ *    1  zero the allocated extents on disk
+ */
+static ssize_t fallocate_zero_blocks_show(struct kobject *kobj,
+					  struct attribute *attr, char *buf)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 osd->od_fallocate_zero_blocks);
+}
+
+static ssize_t fallocate_zero_blocks_store(struct kobject *kobj,
+					   struct attribute *attr,
+					   const char *buffer, size_t count)
+{
+	struct dt_device *dt = container_of(kobj, struct dt_device, dd_kobj);
+	struct osd_device *osd = osd_dt_dev(dt);
+	long val;
+	int rc;
+
+	LASSERT(osd);
+	if (unlikely(osd->od_mnt == NULL))
+		return -EINPROGRESS;
+
+	rc = kstrtol(buffer, 0, &val);
+	if (rc)
+		return rc;
+
+	if (val < -1 || val > 1)
+		return -EINVAL;
+
+	osd->od_fallocate_zero_blocks = val;
+	return count;
+}
+LUSTRE_RW_ATTR(fallocate_zero_blocks);
+
 static struct attribute *xfs_attrs[] = {
+	&lustre_attr_fallocate_zero_blocks.attr,
 	NULL,
 };
 

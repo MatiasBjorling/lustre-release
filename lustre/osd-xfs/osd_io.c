@@ -20,6 +20,8 @@
 #include <linux/pagemap.h>
 #include <linux/uio.h>
 #include <linux/bvec.h>
+#include <linux/fiemap.h>
+#include <linux/falloc.h>
 
 #include <lustre_compat.h>
 
@@ -1285,9 +1287,10 @@ static int osd_punch(const struct lu_env *env, struct dt_object *dt,
 		RETURN(-ENOENT);
 
 	/*
-	 * dbo_punch is only ever reached with end == OBD_OBJECT_EOF: the OFD
-	 * only truncates. Refuse rather than truncate, because truncating
-	 * would destroy data past @end.
+	 * dbo_punch is only ever reached with end == OBD_OBJECT_EOF: a range
+	 * punch arrives from ofd_fallocate_hdl() as a fallocate carrying
+	 * FALLOC_FL_PUNCH_HOLE, which osd_fallocate() handles. Refuse rather
+	 * than truncate, because truncating would destroy data past @end.
 	 */
 	if (end != OBD_OBJECT_EOF) {
 		CDEBUG(D_INODE,
@@ -1375,6 +1378,239 @@ const struct dt_body_operations osd_body_ops_new = {
 	.dbo_declare_write	  = osd_declare_write,
 };
 
+
+/* ------------------------------------------------------------------ */
+/* fiemap, fallocate, ladvise                                          */
+/* ------------------------------------------------------------------ */
+
+/* same bound osd-ldiskfs uses: the array must be addressable */
+#define OSD_FIEMAP_MAX_EXTENTS	(UINT_MAX / sizeof(struct fiemap_extent))
+
+/*
+ * Report the object's extent map to a client asking through `lfs fiemap` or
+ * filefrag(1).
+ *
+ * The caller's buffer is in kernel memory, which is the whole reason
+ * vfs_fiemap_kernel() exists: fiemap_fill_next_extent() writes each extent
+ * with copy_to_user(), so calling ->fiemap directly from here returns -EFAULT.
+ * osd-ldiskfs solves the same problem with an ext4-specific patch that teaches
+ * its fiemap to accept a kernel buffer.
+ */
+static int osd_fiemap_get(const struct lu_env *env, struct dt_object *dt,
+			  struct fiemap *fm)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	struct inode *inode = obj->oo_inode;
+	unsigned int mapped = 0;
+	u64 maxbytes, len;
+	int rc;
+
+	ENTRY;
+
+	if (inode == NULL)
+		RETURN(-ENOENT);
+	if (fm->fm_extent_count > OSD_FIEMAP_MAX_EXTENTS)
+		RETURN(-EINVAL);
+
+	/*
+	 * fiemap_check_ranges() is not exported, so the same clamping is done
+	 * here: refuse a start beyond the addressable range and trim a length
+	 * that would run past it.
+	 */
+	maxbytes = inode->i_sb->s_maxbytes;
+	if (fm->fm_start > maxbytes)
+		RETURN(-EFBIG);
+	len = fm->fm_length;
+	if (len == 0)
+		RETURN(-EINVAL);
+	if (len > maxbytes || maxbytes - len < fm->fm_start)
+		len = maxbytes - fm->fm_start;
+
+	/*
+	 * fm_extent_count == 0 is the caller asking only how many extents
+	 * there are. vfs_fiemap_kernel() rejects a zero-sized array, so answer
+	 * it by mapping into no space at all, which is what the ioctl path
+	 * does.
+	 */
+	if (fm->fm_extent_count == 0) {
+		struct fiemap_extent_info fieinfo = {
+			.fi_flags	 = fm->fm_flags,
+			.fi_extents_max	 = 0,
+		};
+
+		if (inode->i_op->fiemap == NULL)
+			RETURN(-EOPNOTSUPP);
+		rc = inode->i_op->fiemap(inode, &fieinfo, fm->fm_start, len);
+		if (rc && rc != -EAGAIN)
+			RETURN(rc);
+		fm->fm_mapped_extents = fieinfo.fi_extents_mapped;
+		RETURN(0);
+	}
+
+	rc = vfs_fiemap_kernel(inode, &fm->fm_extents[0], fm->fm_extent_count,
+			       fm->fm_start, len, fm->fm_flags, &mapped);
+	if (rc != 0)
+		RETURN(rc);
+
+	fm->fm_mapped_extents = mapped;
+
+	RETURN(0);
+}
+
+/*
+ * Preallocate space for an object, from fallocate(2) on a Lustre file.
+ */
+static int osd_declare_fallocate(const struct lu_env *env,
+				 struct dt_object *dt, struct lu_attr *attr,
+				 __u64 start, __u64 end, int mode,
+				 struct thandle *th,
+				 enum dt_fallocate_error_t *error_code)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	struct osd_thandle *oh = osd_thandle(th);
+	long long space;
+	int rc;
+
+	ENTRY;
+
+	if (obj->oo_inode == NULL)
+		RETURN(-ENOENT);
+
+	/*
+	 * FALLOC_FL_KEEP_SIZE only reserves blocks; anything else moves the
+	 * size too, which is a separate attr_set. PUNCH_HOLE frees blocks
+	 * rather than allocating them, so it is declared like a punch: no
+	 * quota is charged, but an extent split can still need a block.
+	 */
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+		RETURN(-EOPNOTSUPP);
+
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		osd_declare_op(th, OSD_OT_PUNCH, OSD_DECL_BLK_PUNCH, 0);
+		RETURN(0);
+	}
+
+	if (end <= start)
+		RETURN(0);
+	if (end > MAX_LFS_FILESIZE)
+		RETURN(-EFBIG);
+	osd_declare_op(th, OSD_OT_WRITE,
+		       DIV_ROUND_UP_ULL(end - start, i_blocksize(obj->oo_inode)), 0);
+
+	/*
+	 * Charge the whole range against quota. Being generous is the right
+	 * error: a preallocation that is refused is better than one that
+	 * succeeds and then cannot be written into.
+	 */
+	space = stoqb(end - start);
+	rc = osd_declare_inode_qid(env, i_uid_read(obj->oo_inode),
+				   i_gid_read(obj->oo_inode),
+				   osd_get_projid(obj->oo_inode), space, oh,
+				   obj, NULL, true);
+	RETURN(rc);
+}
+
+static int osd_fallocate(const struct lu_env *env, struct dt_object *dt,
+			 __u64 *start, __u64 end, int mode,
+			 struct thandle *th)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	struct osd_device *osd = osd_obj2dev(obj);
+	struct file *file;
+	int rc;
+
+	ENTRY;
+
+	if (obj->oo_inode == NULL || obj->oo_dentry == NULL)
+		RETURN(-ENOENT);
+
+	/*
+	 * Preallocation and hole punching, which is how a range punch reaches
+	 * this backend: ofd_fallocate_hdl() turns it into a fallocate with
+	 * FALLOC_FL_PUNCH_HOLE, never into a dbo_punch call. Anything else
+	 * moves the size too, which is a separate attr_set.
+	 *
+	 * Encrypted objects are refused for a punch rather than rounded.
+	 * Rounding is safe for a truncate because it keeps more data than
+	 * asked; for a hole it would have to shrink the punched range to avoid
+	 * destroying a partial encryption unit, and a punch that silently does
+	 * less than it says is worse than one that declines.
+	 */
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+		RETURN(-EOPNOTSUPP);
+	/*
+	 * -1 disables preallocation; see fallocate_zero_blocks. A punch still
+	 * works.
+	 */
+	if (osd->od_fallocate_zero_blocks < 0 && !(mode & FALLOC_FL_PUNCH_HOLE))
+		RETURN(-EOPNOTSUPP);
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		if (!(mode & FALLOC_FL_KEEP_SIZE))
+			RETURN(-EOPNOTSUPP);
+		if (obj->oo_lma_flags & LMAI_ENCRYPT &&
+		    ((*start | end) & ~LUSTRE_ENCRYPTION_MASK)) {
+			CDEBUG(D_INODE,
+			       "%s: refusing unaligned punch [%llu,%llu) on an encrypted object\n",
+			       osd_name(osd), *start, end);
+			RETURN(-EOPNOTSUPP);
+		}
+	}
+	if (end <= *start)
+		RETURN(0);
+
+	/*
+	 * vfs_fallocate() wants a struct file, so open the object's own
+	 * dentry. This is the same short-lived open the bulk write path uses;
+	 * O_NOATIME because Lustre owns the timestamps of its objects.
+	 */
+	file = dentry_open(&(struct path){ .mnt = osd->od_mnt,
+					   .dentry = obj->oo_dentry },
+			   O_RDWR | O_NOATIME | O_LARGEFILE, current_cred());
+	if (IS_ERR(file))
+		RETURN(PTR_ERR(file));
+
+	osd_exec_op(env, th, mode & FALLOC_FL_PUNCH_HOLE ?
+		    OSD_OT_PUNCH : OSD_OT_WRITE, 0, 0);
+	rc = vfs_fallocate(file, mode, *start, end - *start);
+	fput(file);
+
+	if (rc == 0)
+		*start = end;
+
+	RETURN(rc);
+}
+
+/*
+ * `lfs ladvise`. Only DONTNEED is acted on, which is also all osd-ldiskfs
+ * does: WILLREAD is served by the OFD's own readahead, and the lock hints are
+ * handled above the OSD entirely.
+ */
+static int osd_ladvise(const struct lu_env *env, struct dt_object *dt,
+		       __u64 start, __u64 end, enum lu_ladvise_type advice)
+{
+	struct osd_object *obj = osd_dt_obj(dt);
+	int rc = 0;
+
+	ENTRY;
+
+	if (obj->oo_inode == NULL)
+		RETURN(-ENOENT);
+
+	switch (advice) {
+	case LU_LADVISE_DONTNEED:
+		if (end)
+			invalidate_mapping_pages(obj->oo_inode->i_mapping,
+						 start >> PAGE_SHIFT,
+						 (end - 1) >> PAGE_SHIFT);
+		break;
+	default:
+		rc = -ENOTSUPP;
+		break;
+	}
+
+	RETURN(rc);
+}
+
 const struct dt_body_operations osd_body_ops = {
 	.dbo_read		  = osd_read,
 	.dbo_declare_write	  = osd_declare_write,
@@ -1388,4 +1624,8 @@ const struct dt_body_operations osd_body_ops = {
 	.dbo_declare_punch	  = osd_declare_punch,
 	.dbo_punch		  = osd_punch,
 	.dbo_lseek		  = osd_lseek,
+	.dbo_fiemap_get		  = osd_fiemap_get,
+	.dbo_declare_fallocate	  = osd_declare_fallocate,
+	.dbo_fallocate		  = osd_fallocate,
+	.dbo_ladvise		  = osd_ladvise,
 };
