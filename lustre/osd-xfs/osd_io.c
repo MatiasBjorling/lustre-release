@@ -955,10 +955,11 @@ static int osd_bufs_put(const struct lu_env *env, struct dt_object *dt,
  * and vfs_iter_read/write() are exported, so this needs no kernel change.
  *
  * Writes use O_DIRECT for aligned runs when writethrough caching is off,
- * falling back to buffered I/O when necessary. Both paths use RWF_DSYNC:
- * generic_write_sync() invokes XFS fsync, which handles data-device cache
- * flushes even with an external log or when forcing the log is a no-op.
- * Direct I/O by itself provides no such durability guarantee.
+ * falling back to buffered I/O when necessary. Under a transaction a write
+ * waits for its data and flushes the data device cache, and the commit
+ * worker forces the log once per batch. Without one, a write uses
+ * RWF_DSYNC: XFS fsync handles data-device cache flushes even with an
+ * external log or when forcing the log is a no-op.
  *
  * Reads use the filesystem page cache unless both cache switches are off.
  */
@@ -989,13 +990,27 @@ static bool osd_bulk_aligned(struct osd_object *obj, loff_t off, size_t len)
 }
 
 static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
-			     struct niobuf_local *lnb, int npages, bool write)
+			     struct niobuf_local *lnb, int npages, bool write,
+			     bool data_only)
 {
 	struct osd_device *osd = osd_obj2dev(obj);
 	struct file *fdir = NULL, *fbuf = NULL;
 	struct bio_vec *bvec = NULL;
-	loff_t isize;
+	loff_t isize, lo = LLONG_MAX, hi = 0;
 	int i, rc = 0;
+	/*
+	 * Under a transaction the write needs its data on stable storage
+	 * before trans_stop logs the last_rcvd record that covers it, because
+	 * any background log push can make that record durable. It does not
+	 * need a log force of its own: the data extent of an overwrite is
+	 * already logged, and the commit worker forces the log once for the
+	 * batch. So wait for the data and flush the data device's cache here,
+	 * which is what osd-ldiskfs gets from its ordered data, and skip the
+	 * fsync. RWF_DSYNC did both per write, an fsync with its own log
+	 * force for every RPC: two log forces per 4 KiB write. Without a
+	 * transaction, a write syncs itself.
+	 */
+	const rwf_t wflags = data_only ? 0 : RWF_DSYNC;
 
 	ENTRY;
 
@@ -1019,8 +1034,8 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 	 * the platter. Writing with O_DIRECT regardless leaves the object's
 	 * address space empty after a write, every subsequent read misses, and
 	 * sanity 151 and 156 fail with "NOT IN CACHE" on exactly that
-	 * sequence. RWF_DSYNC makes buffered and direct writes durable before
-	 * reporting success.
+	 * sequence. Either way the write is durable before it is reported
+	 * committed; see the header comment above.
 	 *
 	 * Reads normally stay buffered on purpose, because the OSS page cache
 	 * and its readahead are worth more than the copy they cost. The
@@ -1094,7 +1109,7 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 			      bvec, n, bytes);
 
 		if (write)
-			done = vfs_iter_write(file, &iter, &pos, RWF_DSYNC);
+			done = vfs_iter_write(file, &iter, &pos, wflags);
 		else
 			done = vfs_iter_read(file, &iter, &pos, 0);
 
@@ -1105,7 +1120,8 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 			pos = lnb[i].lnb_file_offset;
 			iov_iter_bvec(&iter, write ? ITER_SOURCE : ITER_DEST,
 				      bvec, n, bytes);
-			done = write ? vfs_iter_write(fbuf, &iter, &pos, RWF_DSYNC)
+			file = fbuf;
+			done = write ? vfs_iter_write(fbuf, &iter, &pos, wflags)
 				     : vfs_iter_read(fbuf, &iter, &pos, 0);
 		}
 
@@ -1118,6 +1134,11 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 
 		if (write && done != (ssize_t)bytes)
 			GOTO(out, rc = -EIO);
+		/* Direct I/O has completed; buffered data is still in cache. */
+		if (write && file == fbuf) {
+			lo = min_t(loff_t, lo, lnb[i].lnb_file_offset);
+			hi = max_t(loff_t, hi, lnb[i].lnb_file_offset + bytes);
+		}
 
 		/*
 		 * A short read is a sparse range or EOF. Lustre expects zeroes
@@ -1146,6 +1167,19 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 
 		i += n;
 	}
+	/*
+	 * file_write_and_wait_range(), not filemap_write_and_wait_range(): the
+	 * latter reports through the mapping-wide AS_EIO/AS_ENOSPC bits and
+	 * clears them, so a concurrent RPC on this object, or the commit
+	 * worker's writeback, could consume this write's error and let it be
+	 * acknowledged. fbuf was opened before the writes, so its errseq
+	 * cursor sees every writeback error since, as the fsync behind
+	 * RWF_DSYNC did.
+	 */
+	if (data_only && lo < hi)
+		rc = file_write_and_wait_range(fbuf, lo, hi - 1);
+	if (data_only && rc == 0 && write)
+		rc = blkdev_issue_flush(osd->od_data_bdev);
 	EXIT;
 out:
 	if (bvec != NULL)
@@ -1184,7 +1218,7 @@ static int osd_read_prep(const struct lu_env *env, struct dt_object *dt,
 		}
 		osd_cache_account(osd_obj2dev(obj), npages, hits);
 	}
-	return osd_bulk_transfer(env, obj, lnb, npages, false);
+	return osd_bulk_transfer(env, obj, lnb, npages, false, false);
 }
 
 /*
@@ -1323,7 +1357,9 @@ static int osd_write_commit(const struct lu_env *env, struct dt_object *dt,
 	if (npages > 0)
 		osd_trans_note_dirty(handle, obj->oo_inode);
 
-	rc = osd_bulk_transfer(env, obj, lnb, npages, true);
+	rc = osd_bulk_transfer(env, obj, lnb, npages, true,
+			       handle != NULL &&
+			       osd_obj2dev(obj)->od_commit_wq != NULL);
 	if (rc != 0)
 		RETURN(rc);
 

@@ -85,14 +85,18 @@
  * So: a timer to catch a trickle, plus an immediate force once enough
  * transactions have piled up.
  *
- * A write RPC without OBD_BRW_ASYNC sets th_sync, so under a streaming write
- * almost every transaction is one whose caller is blocked waiting for it.
- * Those join the batch and wait, so the timer is a latency floor for the RPC
- * as well as the window the batch accumulates in, and it has a peak rather
- * than being monotonic.
+ * The timer applies only to asynchronous transactions. A write RPC without
+ * OBD_BRW_ASYNC sets th_sync, so under direct I/O every write transaction is
+ * one whose caller is blocked waiting for it, and a timer on those is a
+ * latency floor for the RPC. Since the client keeps a fixed number of RPCs
+ * in flight per target, a latency floor is a throughput ceiling: at 25 ms,
+ * 4 KiB random write ran at 1,071 IOPS over six CMR OSTs with the drives 9
+ * percent busy. A synchronous transaction therefore forces at once, or
+ * straight after the force in flight, and whatever arrives during a force
+ * shares the next one: group commit, as jbd2 does for synchronous handles.
  *
- * Measured on six SMR-class SATA OSTs, 1 MiB sequential writes, six jobs at
- * queue depth 16:
+ * Measured for asynchronous batching on six SMR-class SATA OSTs, 1 MiB
+ * sequential writes, six jobs at queue depth 16:
  *
  *	1 ms	533 MiB/s	3.19 transactions per force
  *	4 ms	534 MiB/s	3.23
@@ -102,7 +106,7 @@
  *	100 ms	476 MiB/s	13.01
  *	150 ms	407 MiB/s	15.71
  *
- * Past 25 ms the added RPC latency costs more than the larger batch saves.
+ * Past 25 ms the added latency costs more than the larger batch saves.
  * Tunable per target through commit_delay_ms, because the peak depends on
  * the device and the workload.
  */
@@ -382,6 +386,13 @@ struct osd_device {
 	unsigned int		 od_nonrotational:1;	/* data on flash */
 	/* the XFS realtime device holds the data; metadata stays on the SSD */
 	unsigned int		 od_external_rt:1;
+	/*
+	 * Where object data lives: the realtime device when there is one,
+	 * else the data device. A log force flushes only the log device's
+	 * cache, so a bulk write that skips its fsync flushes this one itself
+	 * before trans_stop can log the record covering it.
+	 */
+	struct block_device	*od_data_bdev;
 	/*
 	 * How fallocate() behaves, matching osd-ldiskfs:
 	 *   -1  disabled, return -EOPNOTSUPP

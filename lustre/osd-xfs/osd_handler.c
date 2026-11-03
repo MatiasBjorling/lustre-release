@@ -239,6 +239,7 @@ static int osd_mount(const struct lu_env *env, struct osd_device *o,
 		o->od_mnt = NULL;
 		GOTO(out, rc = -EINVAL);
 	}
+	o->od_data_bdev = data_bdev;
 
 	/*
 	 * Flash-backed targets get nothing from the page cache; osd-ldiskfs
@@ -663,8 +664,8 @@ static void osd_commit_worker(struct work_struct *work)
 
 	/*
 	 * Finish any outstanding writeback before forcing metadata. Successful
-	 * record and bulk writes already requested filesystem data-sync
-	 * completion; the log force alone is not a data durability barrier.
+	 * record and bulk writes already put their data on stable storage;
+	 * the log force alone is not a data durability barrier.
 	 *
 	 * Done for the batch as a whole so a file every transaction dirties,
 	 * last_rcvd above all, is written back once per force instead of once
@@ -709,20 +710,28 @@ static void osd_commit_worker(struct work_struct *work)
 	}
 
 	/*
-	 * Anything that arrived while we were forcing. Re-arm with the delay,
-	 * not immediately.
-	 *
-	 * Re-arming with 0 was a self-defeating loop: the worker forced, found
-	 * the few transactions that had arrived during the force, forced
-	 * again, and so on. Under a streaming write it managed 2,131 forces in
-	 * 20 seconds batching 2.85 transactions each -- effectively the
-	 * synchronous behaviour it was meant to replace, plus a worker thread
-	 * and a lock. Waiting lets the queue actually build.
+	 * Anything that arrived while we were forcing. Those with a caller
+	 * blocked on them go now: they have already waited one force, and the
+	 * force just finished is the batching window, the same group commit
+	 * jbd2 gives a synchronous handle. A queue of only asynchronous
+	 * transactions waits out the delay, because nobody is waiting on it
+	 * and re-forcing at once for a few arrivals is what made immediate
+	 * re-arming self-defeating under a streaming write.
 	 */
 	spin_lock(&osd->od_commit_lock);
-	if (!list_empty(&osd->od_commit_list) && !osd->od_commit_stopping)
+	if (!list_empty(&osd->od_commit_list) && !osd->od_commit_stopping) {
+		bool waiter = false;
+
+		list_for_each_entry(oh, &osd->od_commit_list, ot_commit_link) {
+			if (oh->ot_commit_done != NULL) {
+				waiter = true;
+				break;
+			}
+		}
 		queue_delayed_work(osd->od_commit_wq, &osd->od_commit_work,
+				   waiter ? 0 :
 				   msecs_to_jiffies(osd->od_commit_delay_ms));
+	}
 	spin_unlock(&osd->od_commit_lock);
 }
 
@@ -748,13 +757,17 @@ static bool osd_commit_defer(struct osd_device *osd, struct osd_thandle *oh)
 	spin_unlock(&osd->od_commit_lock);
 
 	/*
-	 * Enough work has piled up that a force now will batch well: go
-	 * immediately rather than making everyone wait out the timer. Under
-	 * load this is the path that always fires, so the delay never appears
-	 * in a client's latency.
+	 * A caller blocked on this transaction gets a force now, or straight
+	 * after the one in flight; transactions that arrive meanwhile share
+	 * it. Waiting out a timer instead caps a target at its client's RPCs
+	 * in flight per delay: with 25 ms and the usual nine write RPCs per
+	 * OST, 4 KiB random write ran at 1,071 IOPS over six OSTs with the
+	 * drives 9 percent busy, against 3,928 with no delay. Only
+	 * asynchronous transactions, which nobody waits on, wait for the
+	 * timer, unless enough have piled up that a force now batches well.
 	 */
 	if (!osd->od_commit_defer || oh->ot_commit_rc != 0 ||
-	    pending >= OSD_COMMIT_BATCH_MAX)
+	    oh->ot_commit_done != NULL || pending >= OSD_COMMIT_BATCH_MAX)
 		mod_delayed_work(osd->od_commit_wq, &osd->od_commit_work, 0);
 	else
 		queue_delayed_work(osd->od_commit_wq, &osd->od_commit_work,
