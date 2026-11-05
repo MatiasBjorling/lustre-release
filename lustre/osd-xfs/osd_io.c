@@ -989,6 +989,161 @@ static bool osd_bulk_aligned(struct osd_object *obj, loff_t off, size_t len)
 	return IS_ALIGNED(off, bs) && IS_ALIGNED(len, bs);
 }
 
+/*
+ * Fill the tail of a short read with zeroes and set every lnb_rc to its full
+ * length; a short read is a sparse range or EOF and Lustre expects zeroes.
+ */
+static void osd_bulk_read_fill(struct niobuf_local *lnb, int first, int n,
+			       size_t filled)
+{
+	int j;
+
+	for (j = first; j < first + n; j++) {
+		size_t l = lnb[j].lnb_len;
+
+		if (filled < l) {
+			void *k = kmap_local_page(lnb[j].lnb_page);
+
+			memset(k + lnb[j].lnb_page_offset + filled, 0,
+			       l - filled);
+			kunmap_local(k);
+			if (filled == 0)
+				lnb[j].lnb_hole = 1;
+		}
+		filled -= min(filled, l);
+		lnb[j].lnb_rc = l;
+	}
+}
+
+/* One contiguous run of an RPC's pages, read with its own kiocb. */
+struct osd_aread {
+	struct kiocb		 ar_iocb;
+	struct iov_iter		 ar_iter;
+	loff_t			 ar_pos;
+	size_t			 ar_bytes;
+	ssize_t			 ar_done;
+	int			 ar_first;
+	int			 ar_n;
+	atomic_t		*ar_pending;
+	struct completion	*ar_all;
+};
+
+static void osd_aread_complete(struct kiocb *iocb, long ret)
+{
+	struct osd_aread *ar = container_of(iocb, struct osd_aread, ar_iocb);
+
+	ar->ar_done = ret;
+	if (atomic_dec_and_test(ar->ar_pending))
+		complete(ar->ar_all);
+}
+
+/*
+ * Direct read of an RPC whose pages form more than one contiguous run.
+ *
+ * Each run is submitted as an asynchronous direct read and the function
+ * then waits once for all of them, as osd-ldiskfs submits every bio of an
+ * RPC before waiting. Reading the runs one after another instead keeps a
+ * single request of the RPC at the drive at a time: with the client's nine
+ * RPCs in flight per OST, 4 KiB random read held 8.5 reads in flight at
+ * each CMR drive against 10.7 on osd-ldiskfs, and ran at 2,742 against
+ * 3,057 IOPS over six OSTs.
+ *
+ * Runs past EOF are zero-filled, and runs the direct path refuses (an
+ * unaligned tail, or -EINVAL) are read through @fbuf, both synchronously.
+ * Every submitted run is waited for before returning, on every path,
+ * because its bios reference the RPC's pages.
+ */
+static int osd_bulk_read_runs(struct osd_object *obj, struct file *fdir,
+			      struct file *fbuf, struct niobuf_local *lnb,
+			      int npages, int nruns, struct bio_vec *bvec)
+{
+	struct osd_device *osd = osd_obj2dev(obj);
+	DECLARE_COMPLETION_ONSTACK(all);
+	atomic_t pending = ATOMIC_INIT(1);
+	loff_t isize = i_size_read(obj->oo_inode);
+	struct osd_aread *ars;
+	int i, r = 0, rc = 0;
+
+	OBD_ALLOC_PTR_ARRAY_LARGE(ars, nruns);
+	if (ars == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < npages; ) {
+		struct osd_aread *ar;
+		size_t bytes;
+		int n, j;
+
+		n = osd_bulk_run(lnb, npages, i, &bytes);
+		if (n == 0) {
+			i++;
+			continue;
+		}
+		LASSERT(r < nruns);
+		ar = &ars[r++];
+		ar->ar_first = i;
+		ar->ar_n = n;
+		ar->ar_pos = lnb[i].lnb_file_offset;
+		ar->ar_done = 0;
+		i += n;
+
+		if (ar->ar_pos >= isize) {
+			ar->ar_bytes = 0;
+			continue;
+		}
+		ar->ar_bytes = min_t(loff_t, bytes, isize - ar->ar_pos);
+		for (j = 0; j < n; j++)
+			bvec_set_page(&bvec[ar->ar_first + j],
+				      lnb[ar->ar_first + j].lnb_page,
+				      lnb[ar->ar_first + j].lnb_len,
+				      lnb[ar->ar_first + j].lnb_page_offset);
+		iov_iter_bvec(&ar->ar_iter, ITER_DEST, &bvec[ar->ar_first], n,
+			      ar->ar_bytes);
+
+		if (osd_bulk_aligned(obj, ar->ar_pos, ar->ar_bytes)) {
+			ssize_t ret;
+
+			init_sync_kiocb(&ar->ar_iocb, fdir);
+			ar->ar_iocb.ki_pos = ar->ar_pos;
+			ar->ar_iocb.ki_complete = osd_aread_complete;
+			ar->ar_pending = &pending;
+			ar->ar_all = &all;
+			atomic_inc(&pending);
+			ret = vfs_iocb_iter_read(fdir, &ar->ar_iocb,
+						 &ar->ar_iter);
+			if (ret == -EIOCBQUEUED)
+				continue;
+			/* Completed inline: the callback will not run. */
+			atomic_dec(&pending);
+			if (ret != -EINVAL) {
+				ar->ar_done = ret;
+				continue;
+			}
+			iov_iter_bvec(&ar->ar_iter, ITER_DEST,
+				      &bvec[ar->ar_first], n, ar->ar_bytes);
+		}
+		ar->ar_done = vfs_iter_read(fbuf, &ar->ar_iter, &ar->ar_pos, 0);
+	}
+
+	if (!atomic_dec_and_test(&pending))
+		wait_for_completion(&all);
+
+	for (i = 0; i < r; i++) {
+		struct osd_aread *ar = &ars[i];
+
+		if (ar->ar_done < 0) {
+			CERROR("%s: bulk read at %llu+%zu failed: rc = %zd\n",
+			       osd_name(osd), lnb[ar->ar_first].lnb_file_offset,
+			       ar->ar_bytes, ar->ar_done);
+			if (rc == 0)
+				rc = ar->ar_done;
+			continue;
+		}
+		osd_bulk_read_fill(lnb, ar->ar_first, ar->ar_n, ar->ar_done);
+	}
+	OBD_FREE_PTR_ARRAY_LARGE(ars, nruns);
+	return rc;
+}
+
 static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 			     struct niobuf_local *lnb, int npages, bool write,
 			     bool data_only)
@@ -1064,6 +1219,28 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 	}
 
 	isize = i_size_read(obj->oo_inode);
+
+	/*
+	 * A direct read RPC of several runs goes to the drive all at once; see
+	 * osd_bulk_read_runs(). One run, the common sequential case, needs no
+	 * kiocb bookkeeping and stays on the loop below.
+	 */
+	if (!write && fdir != NULL) {
+		int nruns = 0;
+		size_t bytes;
+
+		for (i = 0; i < npages; ) {
+			int n = osd_bulk_run(lnb, npages, i, &bytes);
+
+			i += n ? n : 1;
+			nruns += n ? 1 : 0;
+		}
+		if (nruns > 1) {
+			rc = osd_bulk_read_runs(obj, fdir, fbuf, lnb, npages,
+						nruns, bvec);
+			GOTO(out, rc);
+		}
+	}
 
 	for (i = 0; i < npages; ) {
 		struct iov_iter iter;
@@ -1144,25 +1321,11 @@ static int osd_bulk_transfer(const struct lu_env *env, struct osd_object *obj,
 		 * A short read is a sparse range or EOF. Lustre expects zeroes
 		 * and the full length in lnb_rc, so fill the remainder.
 		 */
-		{
-			size_t filled = done;
-
-			for (j = 0; j < n; j++) {
-				size_t l = lnb[i + j].lnb_len;
-
-				if (!write && filled < l) {
-					void *k;
-
-					k = kmap_local_page(lnb[i + j].lnb_page);
-					memset(k + lnb[i + j].lnb_page_offset +
-					       filled, 0, l - filled);
-					kunmap_local(k);
-					if (filled == 0)
-						lnb[i + j].lnb_hole = 1;
-				}
-				filled -= min(filled, l);
-				lnb[i + j].lnb_rc = l;
-			}
+		if (write) {
+			for (j = 0; j < n; j++)
+				lnb[i + j].lnb_rc = lnb[i + j].lnb_len;
+		} else {
+			osd_bulk_read_fill(lnb, i, n, done);
 		}
 
 		i += n;
